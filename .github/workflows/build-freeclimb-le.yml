@@ -1,0 +1,258 @@
+name: Build FreeClimb LE (teste da compilacao)
+
+# Corre so quando voce clicar em "Run workflow" na aba Actions.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Baixar o conteudo do repositorio
+        uses: actions/checkout@v4
+
+      - name: Preparar o MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Obter o codigo-fonte do SKSE para Skyrim LE (1.7.3)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ws = $env:GITHUB_WORKSPACE
+          $archive = Join-Path $ws 'skse_1_7_3.7z'
+          # O codigo-fonte do SKSE LE vem DENTRO do arquivo normal, na pasta "src".
+          $local = Join-Path $ws 'third_party\skse_1_07_03.7z'
+          if (Test-Path $local) {
+            Write-Host "A usar o ficheiro que esta no repositorio: $local"
+            Copy-Item $local $archive
+          } else {
+            $urls = @(
+              'https://skse.silverlock.org/beta/skse_1_07_03.7z',
+              'http://skse.silverlock.org/beta/skse_1_07_03.7z'
+            )
+            $done = $false
+            foreach ($url in $urls) {
+              try {
+                Write-Host "A baixar $url"
+                Invoke-WebRequest -Uri $url -OutFile $archive -UserAgent 'Mozilla/5.0'
+                $done = $true
+                break
+              } catch {
+                Write-Host "Falhou: $($_.Exception.Message)"
+              }
+            }
+            if (-not $done) { throw 'Nao consegui baixar o SKSE. Use o plano B do LEIA-ME (third_party).' }
+          }
+          Write-Host ("Tamanho do arquivo: {0} bytes" -f (Get-Item $archive).Length)
+          & "C:\Program Files\7-Zip\7z.exe" x $archive "-o$ws\skse_src" -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "O 7-Zip nao conseguiu abrir o arquivo (codigo $LASTEXITCODE)." }
+          Write-Host "Pastas extraidas (ate 3 niveis):"
+          Get-ChildItem "$ws\skse_src" -Recurse -Depth 3 -Directory |
+            ForEach-Object { $_.FullName.Replace($ws, '') }
+
+      - name: Montar o projeto dentro da arvore do SKSE
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ws = $env:GITHUB_WORKSPACE
+          # A raiz do codigo e a pasta que tem "common\IPrefix.h" e "skse\skse\PluginAPI.h".
+          $root = $null
+          foreach ($m in (Get-ChildItem "$ws\skse_src" -Recurse -Filter IPrefix.h |
+                          Where-Object { $_.Directory.Name -eq 'common' })) {
+            $candidate = $m.Directory.Parent.FullName
+            if (Test-Path "$candidate\skse\skse\PluginAPI.h") { $root = $candidate; break }
+          }
+          if (-not $root) { throw 'Nao encontrei a raiz do codigo do SKSE (common\IPrefix.h + skse\skse\PluginAPI.h). Veja a lista de pastas do passo anterior.' }
+          Write-Host "Raiz do SKSE: $root"
+
+          # O projeto importa ..\..\config\_Plugins.props. Se o SKSE nao trouxer um, cria-se um vazio.
+          if (-not (Test-Path "$root\config\_Plugins.props")) {
+            New-Item -ItemType Directory -Force "$root\config" | Out-Null
+            Set-Content "$root\config\_Plugins.props" '<?xml version="1.0" encoding="utf-8"?><Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003"></Project>'
+            Write-Host 'Criei um _Plugins.props vazio (o SKSE nao trazia um).'
+          }
+
+          # O codigo antigo do SKSE usa std::string (e afins) sem incluir os cabecalhos
+          # padrao; compiladores antigos deixavam passar, o do VS2022 nao. O IPrefix.h e
+          # incluido em todos os ficheiros, entao acrescentamos os cabecalhos no fim dele.
+          $prefix = "$root\common\IPrefix.h"
+          if (-not (Select-String -Path $prefix -Pattern 'FREERUN_STD_COMPAT' -Quiet)) {
+            Add-Content -Path $prefix -Value @(
+              '',
+              '// FREERUN_STD_COMPAT: cabecalhos padrao que o codigo antigo do SKSE assume',
+              '#ifdef __cplusplus',
+              '#include <string>',
+              '#include <vector>',
+              '#include <map>',
+              '#include <set>',
+              '#include <list>',
+              '#include <algorithm>',
+              '#include <memory>',
+              '#include <cstdint>',
+              '#include <cstddef>',
+              '#include <cstring>',
+              '#include <cstdio>',
+              '#include <cstdlib>',
+              '#include <cmath>',
+              '#endif'
+            )
+            Write-Host 'Acrescentei os cabecalhos padrao ao common\IPrefix.h'
+          }
+
+          $dest = "$root\skse\FreeClimbLE"
+          New-Item -ItemType Directory -Force $dest | Out-Null
+          Copy-Item "$ws\freeclimb-le\*" $dest -Recurse -Force
+          "SKSE_ROOT=$root" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Compilar (Release, 32 bits)
+        shell: pwsh
+        run: |
+          $root = $env:SKSE_ROOT
+          $log = Join-Path $env:GITHUB_WORKSPACE 'build.log'
+          $opts = @('/m', '/p:Configuration=Release', '/p:Platform=Win32', '/p:PlatformToolset=v143',
+                    "/p:SolutionDir=$root\skse", '/p:SeRuntimeVersion=0x01090200', '/v:minimal')
+          $commonDir = "$root\common"
+          $proj = "$commonDir\common_vc9.vcxproj"
+
+          # --- A biblioteca "common" do SKSE -------------------------------------------
+          # O SKSE 1.7.3 e de 2011 e traz projetos no formato antigo (.vcproj), que o
+          # MSBuild atual nao abre. Criamos aqui um projeto novo com os mesmos ficheiros.
+          '=== ficheiros de projeto em common ===' | Out-File $log
+          Get-ChildItem $commonDir -File |
+            Where-Object { $_.Extension -in '.vcproj', '.vcxproj', '.sln' } |
+            ForEach-Object { $_.Name } | Tee-Object -FilePath $log -Append
+
+          $all = @()
+          $vcproj = Get-ChildItem $commonDir -Filter '*.vcproj' -File | Select-Object -First 1
+          if ($vcproj) {
+            $xml = New-Object System.Xml.XmlDocument
+            $xml.Load($vcproj.FullName)
+            $all = @($xml.SelectNodes('//File') |
+              ForEach-Object { $_.GetAttribute('RelativePath') } |
+              Where-Object { $_ -match '\.cpp$' } |
+              ForEach-Object { $_ -replace '^\.\\', '' } |
+              Where-Object { Test-Path (Join-Path $commonDir $_) } | Select-Object -Unique)
+          }
+          if ($all.Count -eq 0) {
+            $all = @(Get-ChildItem $commonDir -Filter '*.cpp' -File | ForEach-Object { $_.Name })
+          }
+          $coreNames = 'IDebugLog.cpp', 'IErrors.cpp', 'IFileStream.cpp', 'IDataStream.cpp',
+                       'ICriticalSection.cpp', 'IDirectoryIterator.cpp', 'IBufferStream.cpp',
+                       'IThread.cpp', 'ITimer.cpp'
+          $core = @($coreNames | Where-Object { Test-Path (Join-Path $commonDir $_) })
+
+          $template = @(
+            '<?xml version="1.0" encoding="utf-8"?>',
+            '<Project DefaultTargets="Build" ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">',
+            '  <ItemGroup Label="ProjectConfigurations">',
+            '    <ProjectConfiguration Include="Release|Win32">',
+            '      <Configuration>Release</Configuration>',
+            '      <Platform>Win32</Platform>',
+            '    </ProjectConfiguration>',
+            '  </ItemGroup>',
+            '  <PropertyGroup Label="Globals">',
+            '    <ProjectGuid>{20C6411C-596F-4B85-BE4E-8BC91F59D8A6}</ProjectGuid>',
+            '    <RootNamespace>common</RootNamespace>',
+            '    <Keyword>Win32Proj</Keyword>',
+            '    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>',
+            '  </PropertyGroup>',
+            '  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />',
+            '  <PropertyGroup Label="Configuration">',
+            '    <ConfigurationType>StaticLibrary</ConfigurationType>',
+            '    <PlatformToolset>v143</PlatformToolset>',
+            '    <CharacterSet>MultiByte</CharacterSet>',
+            '  </PropertyGroup>',
+            '  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />',
+            '  <PropertyGroup>',
+            '    <OutDir>$(MSBuildProjectDirectory)\Release\</OutDir>',
+            '    <IntDir>$(MSBuildProjectDirectory)\Release\obj\</IntDir>',
+            '    <TargetName>common_vc9</TargetName>',
+            '  </PropertyGroup>',
+            '  <ItemDefinitionGroup>',
+            '    <ClCompile>',
+            '      <WarningLevel>Level3</WarningLevel>',
+            '      <Optimization>MaxSpeed</Optimization>',
+            '      <PreprocessorDefinitions>NDEBUG;WIN32;_WINDOWS;_LIB;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>',
+            '      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>',
+            '      <AdditionalIncludeDirectories>$(MSBuildProjectDirectory);$(MSBuildProjectDirectory)\..;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>',
+            '      <ForcedIncludeFiles>IPrefix.h;%(ForcedIncludeFiles)</ForcedIncludeFiles>',
+            '      <DisableSpecificWarnings>4996;4244;4267;%(DisableSpecificWarnings)</DisableSpecificWarnings>',
+            '      <MultiProcessorCompilation>true</MultiProcessorCompilation>',
+            '      <DebugInformationFormat>None</DebugInformationFormat>',
+            '    </ClCompile>',
+            '  </ItemDefinitionGroup>',
+            '  <ItemGroup>',
+            '@@FILES@@',
+            '  </ItemGroup>',
+            '  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />',
+            '</Project>'
+          )
+          function Write-CommonProject($names) {
+            $items = $names | ForEach-Object { '    <ClCompile Include="' + $_ + '" />' }
+            $text = ($template -join "`r`n").Replace('@@FILES@@', ($items -join "`r`n"))
+            Set-Content -Path $proj -Value $text -Encoding utf8
+          }
+
+          $built = $false
+          $attempts = @(
+            @{ name = 'todos os ficheiros do common'; files = $all },
+            @{ name = 'conjunto minimo'; files = $core }
+          )
+          foreach ($a in $attempts) {
+            Write-Host "Tentativa: $($a.name) ($($a.files.Count) ficheiros)"
+            Write-CommonProject $a.files
+            "=== common: $($a.name) ===" | Out-File $log -Append
+            msbuild $proj @opts 2>&1 | Tee-Object -FilePath $log -Append
+            if ($LASTEXITCODE -eq 0) { $built = $true; break }
+            Write-Host '--- erros desta tentativa ---'
+            Select-String -Path $log -Pattern ' error ' | Select-Object -Last 15 | ForEach-Object { $_.Line.Trim() }
+          }
+          if (-not $built) { throw 'A biblioteca common do SKSE nao compilou (veja os erros acima).' }
+
+          $lib = Get-ChildItem $commonDir -Recurse -Filter 'common_vc9.lib' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $lib) { throw 'A common compilou mas nao encontrei a common_vc9.lib.' }
+          Write-Host "Biblioteca encontrada: $($lib.FullName)"
+
+          # --- Dizer ao linker para usar essa biblioteca -----------------------------
+          $props = @(
+            '<Project>',
+            '  <ItemDefinitionGroup>',
+            '    <Link>',
+            "      <AdditionalDependencies>$($lib.FullName);%(AdditionalDependencies)</AdditionalDependencies>",
+            '    </Link>',
+            '  </ItemDefinitionGroup>',
+            '</Project>'
+          )
+          Set-Content -Path "$root\skse\FreeClimbLE\Directory.Build.props" -Value $props
+
+          # --- O plugin -----------------------------------------------------------------
+          '=== FreeClimbLE ===' | Out-File $log -Append
+          msbuild "$root\skse\FreeClimbLE\FreeClimbLE.vcxproj" @opts "/p:SdkTrimPrefix=$root" 2>&1 | Tee-Object -FilePath $log -Append
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host '=== PRIMEIROS ERROS (copie daqui) ==='
+            Select-String -Path $log -Pattern ' error ' | Select-Object -First 40 | ForEach-Object { $_.Line.Trim() }
+            throw "A compilacao falhou (codigo $LASTEXITCODE). Veja o build.log."
+          }
+
+      - name: Reunir o resultado
+        if: always()
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:GITHUB_WORKSPACE 'out'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          if ($env:SKSE_ROOT) {
+            Get-ChildItem $env:SKSE_ROOT -Recurse -Filter FreeClimbLE.dll -ErrorAction SilentlyContinue |
+              Copy-Item -Destination $out
+          }
+          $log = Join-Path $env:GITHUB_WORKSPACE 'build.log'
+          if (Test-Path $log) { Copy-Item $log $out }
+          "Passo concluido em $(Get-Date -Format s)" | Out-File (Join-Path $out 'info.txt')
+          Get-ChildItem $out | Format-Table Name, Length
+
+      - name: Guardar o resultado para download
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resultado
+          path: out
+          if-no-files-found: warn
