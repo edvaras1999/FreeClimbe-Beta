@@ -35,6 +35,7 @@ namespace
 		float	minLedge, maxLedge;					// bordas a passar por cima (altura acima dos pes)
 		float	headHeight;		// altura da cabeca: onde se procura o topo da parede
 		int		alwaysCling;	// 1 = o salto junto a uma parede agarra-se sempre; 0 = passa por cima se for baixa
+		int		faceWall;		// 1 = vira o personagem de frente para a parede enquanto agarrado
 	};
 	Config g_cfg;
 
@@ -45,6 +46,7 @@ namespace
 		g_cfg.minLedge = 80.0f;	g_cfg.maxLedge = 180.0f;
 		g_cfg.headHeight = 125.0f;
 		g_cfg.alwaysCling = 1;
+		g_cfg.faceWall = 1;
 	}
 
 	bool ReadWholeFile(const char * path, std::string * out)
@@ -107,11 +109,12 @@ namespace
 			else if(KeyIs(key, "MaxLedge"))		g_cfg.maxLedge = f;
 			else if(KeyIs(key, "HeadHeight"))	g_cfg.headHeight = f;
 			else if(KeyIs(key, "AlwaysCling"))	g_cfg.alwaysCling = atoi(value.c_str());
+			else if(KeyIs(key, "FaceWall"))		g_cfg.faceWall = atoi(value.c_str());
 		}
 
-		_MESSAGE("gameplay: settings: reach %.0f, wall gap %.0f, speeds up/down/side %.0f/%.0f/%.0f, ledge %.0f-%.0f, head %.0f, alwaysCling %d",
+		_MESSAGE("gameplay: settings: reach %.0f, wall gap %.0f, speeds up/down/side %.0f/%.0f/%.0f, ledge %.0f-%.0f, head %.0f, alwaysCling %d, faceWall %d",
 				 (double)g_cfg.reach, (double)g_cfg.gap, (double)g_cfg.climbSpeed, (double)g_cfg.downSpeed, (double)g_cfg.sideSpeed,
-				 (double)g_cfg.minLedge, (double)g_cfg.maxLedge, (double)g_cfg.headHeight, g_cfg.alwaysCling);
+				 (double)g_cfg.minLedge, (double)g_cfg.maxLedge, (double)g_cfg.headHeight, g_cfg.alwaysCling, g_cfg.faceWall);
 	}
 
 	// ------------------------------------------------------------------ estado
@@ -130,6 +133,10 @@ namespace
 	float			g_phase = 0.0f;
 	int				g_motion = kHang;
 	float			g_destX = 0, g_destY = 0, g_destZ = 0;
+	DWORD			g_mantleStart = 0;
+	float			g_mantleStartPos[3], g_mantleDir[2], g_mantleScaleY = 1.0f, g_mantleScaleZ = 1.0f, g_mantleSecs = 1.87f;
+	float			g_rest[99 * 10], g_buf[99 * 10];
+	bool			g_restOk = false;
 
 	struct InputState { volatile LONG forward, back, left, right, jumpEdge, sneakEdge; };
 	InputState g_in;
@@ -218,15 +225,28 @@ namespace
 	}
 
 	// ------------------------------------------------------------------ passar por cima da borda
-	// Chamada no fim da animacao (na thread que atualiza o esqueleto): coloca o personagem em cima da borda.
-	void OnMantleFinished()
+	// O personagem MOVE-SE mesmo ao longo do caminho da animacao (a camara e as armas acompanham-no) e, no fim,
+	// ja esta em cima da borda: nao ha "salto" de posicao. O desenho do corpo usa so as rotacoes do clipe.
+	void FinishMantle()
 	{
 		Actor * player = ThePlayer();
 		void * ctrl = player ? Engine::CharController(player) : NULL;
 		if(ctrl) PlaceController(ctrl, g_destX, g_destY, g_destZ + 1.0f);
-		_MESSAGE("gameplay: climb finished - player placed on top at (%.0f %.0f %.0f)", (double)g_destX, (double)g_destY, (double)g_destZ);
 		SceneHooksSetManualPose(false, kHang, 0, 1, 1);
 		InterlockedExchange(&g_state, kIdle);
+		_MESSAGE("gameplay: climb finished - player on top at (%.0f %.0f %.0f)", (double)g_destX, (double)g_destY, (double)g_destZ);
+	}
+
+	void TickMantle(void * ctrl, DWORD now)
+	{
+		const float phase = (float)(now - g_mantleStart) / 1000.0f / g_mantleSecs;
+		if(phase >= 1.0f || !FC_SampleMotion(kMantle, phase, g_buf)) { FinishMantle(); return; }
+
+		// o deslocamento do centro do corpo no clipe, ajustado a borda real, passa a ser o movimento do personagem
+		const float dy = (g_buf[4 * 10 + 1] - g_rest[4 * 10 + 1]) * g_mantleScaleY;
+		const float dz = (g_buf[4 * 10 + 2] - g_rest[4 * 10 + 2]) * g_mantleScaleZ;
+		PlaceController(ctrl, g_mantleStartPos[0] + g_mantleDir[0] * dy, g_mantleStartPos[1] + g_mantleDir[1] * dy, g_mantleStartPos[2] + dz);
+		SceneHooksSetManualPose(true, kMantle, phase, 0.0f, 0.0f);			// escalas 0: so as rotacoes, sem deslocar o corpo
 	}
 
 	// Comeca a passar por cima da borda a partir do ponto (px,py,pz), virado para (fx,fy).
@@ -235,16 +255,22 @@ namespace
 		Ledge ledge;
 		if(!FindLedge(player, fx, fy, px, py, pz, &ledge, reason)) return false;
 
-		const float scaleZ = ledge.height / kMantleUp;
+		if(!g_restOk) g_restOk = FC_GetPose(0, g_rest);
+		const float secs = FC_MotionSeconds(kMantle);
+		if(!g_restOk || secs <= 0.0f) { *reason = "mantle animation not available"; return false; }
+
 		const float forward = ledge.wallDistance + 40.0f;
-		const float scaleY = forward / kMantleForward;
+		g_mantleScaleZ = ledge.height / kMantleUp;
+		g_mantleScaleY = forward / kMantleForward;
+		g_mantleSecs = secs;
+		g_mantleStartPos[0] = px; g_mantleStartPos[1] = py; g_mantleStartPos[2] = pz;
+		g_mantleDir[0] = fx; g_mantleDir[1] = fy;
 		g_destX = px + fx * forward;
 		g_destY = py + fy * forward;
 		g_destZ = ledge.topZ;
+		g_mantleStart = g_lastTick = GetTickCount();
 
-		SceneHooksSetManualPose(false, kHang, 0, 1, 1);							// a pose em loop da lugar a animacao de uma vez
-		if(!SceneHooksPlayMotion(kMantle, scaleY, scaleZ, &OnMantleFinished)) { *reason = "pose engine not ready"; return false; }
-
+		SceneHooksSetManualPose(true, kMantle, 0.0f, 0.0f, 0.0f);
 		InterlockedExchange(&g_state, kTopOut);
 		_MESSAGE("gameplay: MANTLE over a ledge %.0f units above the feet (wall %.0f ahead)", (double)ledge.height, (double)ledge.wallDistance);
 		return true;
@@ -257,8 +283,10 @@ namespace
 		void * ctrl = player ? Engine::CharController(player) : NULL;
 		if(ctrl)
 		{
-			__declspec(align(16)) float stop[4] = { 0, 0, 0, 0 };
-			Engine::ControllerSetLinearVelocity(ctrl, stop);
+			// um pequeno empurrao para longe da parede, para nao ficar encostado a geometria ao cair
+			const float v = (g_state == kCling ? 60.0f : 0.0f) * Engine::HavokScale();
+			__declspec(align(16)) float push[4] = { g_n[0] * v, g_n[1] * v, 0.0f, 0.0f };
+			Engine::ControllerSetLinearVelocity(ctrl, push);
 		}
 		SceneHooksSetManualPose(false, kHang, 0, 1, 1);
 		InterlockedExchange(&g_state, kIdle);
@@ -278,6 +306,7 @@ namespace
 		g_pos[2] = feet.z;
 
 		PlaceController(ctrl, g_pos[0], g_pos[1], g_pos[2]);
+		if(g_cfg.faceWall) Engine::Rotation(player).z = atan2f(-g_n[0], -g_n[1]);
 
 		g_phase = 0.0f; g_motion = kHang;
 		g_attachTime = g_lastTick = GetTickCount();
@@ -292,13 +321,15 @@ namespace
 	// A cada atualizacao do esqueleto do jogador (thread de trabalho do jogo).
 	void OnTick()
 	{
-		if(g_state != kCling) return;
+		if(g_state == kIdle) return;
 
 		Actor * player = ThePlayer();
 		void * ctrl = player ? Engine::CharController(player) : NULL;
 		if(!ctrl) { Release("no controller"); return; }
 
 		const DWORD now = GetTickCount();
+		if(g_state == kTopOut) { g_lastTick = now; TickMantle(ctrl, now); return; }
+
 		float dt = (float)(now - g_lastTick) / 1000.0f;
 		if(dt > 0.1f) dt = 0.1f;
 		g_lastTick = now;
@@ -325,6 +356,22 @@ namespace
 		}
 		else g_phase = 0.0f;
 
+		// canto INTERIOR: ha outra parede mesmo ao lado, no sentido do movimento? Passa para ela (em vez de entrar nela).
+		if(vt != 0.0f)
+		{
+			const float tx = (vt > 0.0f) ? -g_n[1] : g_n[1], ty = (vt > 0.0f) ? g_n[0] : -g_n[0];
+			static const float chestH[1] = { 70.0f };
+			const WallHit side = ProbeWall(player, tx, ty, g_pos[0], g_pos[1], g_pos[2], fabsf(vt) * dt + 18.0f, chestH, 1);
+			if(side.found)
+			{
+				g_n[0] = side.nx; g_n[1] = side.ny;
+				g_pos[0] = side.x + g_n[0] * g_cfg.gap;
+				g_pos[1] = side.y + g_n[1] * g_cfg.gap;
+				vt = 0.0f;
+				_MESSAGE("gameplay: inner corner - switched to the next wall");
+			}
+		}
+
 		// onde fica o personagem agora: sobe/desce em z e anda de lado ao longo da parede (a direita = (-ny, nx))
 		g_pos[0] += (-g_n[1]) * vt * dt;
 		g_pos[1] += ( g_n[0]) * vt * dt;
@@ -336,6 +383,25 @@ namespace
 		const WallHit w = ProbeWall(player, fx, fy, g_pos[0], g_pos[1], g_pos[2], g_cfg.gap + 40.0f, chest, 1);
 		if(!w.found)
 		{
+			if(vt != 0.0f)
+			{
+				// canto EXTERIOR (por exemplo, a esquina de um pilar): procura a face seguinte, por tras da esquina
+				const float tx = (vt > 0.0f) ? -g_n[1] : g_n[1], ty = (vt > 0.0f) ? g_n[0] : -g_n[0];
+				const float off = g_cfg.gap + 20.0f;
+				static const float chestH[1] = { 70.0f };
+				const WallHit around = ProbeWall(player, -tx, -ty, g_pos[0] - g_n[0] * off, g_pos[1] - g_n[1] * off, g_pos[2], g_cfg.gap + 70.0f, chestH, 1);
+				if(around.found)
+				{
+					g_n[0] = around.nx; g_n[1] = around.ny;
+					g_pos[0] = around.x + g_n[0] * g_cfg.gap;
+					g_pos[1] = around.y + g_n[1] * g_cfg.gap;
+					if(g_cfg.faceWall) Engine::Rotation(player).z = atan2f(-g_n[0], -g_n[1]);
+					PlaceController(ctrl, g_pos[0], g_pos[1], g_pos[2]);
+					SceneHooksSetManualPose(true, g_motion, g_phase, 1.0f, 1.0f);
+					_MESSAGE("gameplay: outer corner - wrapped around to the next face");
+					return;
+				}
+			}
 			if(up)
 			{
 				const char * why = "";
@@ -371,6 +437,7 @@ namespace
 			if(ground.didHit && ground.normal.z > 0.6f) { Release("reached the ground"); return; }
 		}
 
+		if(g_cfg.faceWall) Engine::Rotation(player).z = atan2f(-g_n[0], -g_n[1]);
 		PlaceController(ctrl, g_pos[0], g_pos[1], g_pos[2]);
 		SceneHooksSetManualPose(true, g_motion, g_phase, 1.0f, 1.0f);
 	}
@@ -391,11 +458,12 @@ namespace
 	bool Busy()
 	{
 		if(g_state == kIdle) return false;
-		if(GetTickCount() - g_lastTick > 2500 && g_state == kCling)
+		if(GetTickCount() - g_lastTick > 2500)
 		{
-			_MESSAGE("gameplay: no skeleton updates for 2.5 s - releasing the controls");
+			_MESSAGE("gameplay: no skeleton updates for 2.5 s - releasing the controls and looking for the skeleton again");
 			SceneHooksSetManualPose(false, kHang, 0, 1, 1);
 			InterlockedExchange(&g_state, kIdle);
+			SceneHooksRefreshTarget();
 			return false;
 		}
 		return true;
@@ -414,6 +482,8 @@ namespace
 
 		void * ctrl = Engine::CharController(player);
 		if(!ctrl || Engine::ControllerState(ctrl) != Engine::Controller::kState_OnGround) return false;
+
+		if(!SceneHooksRefreshTarget()) return false;							// o jogo reconstroi o corpo (equipar, combate, celulas): reencontra-o
 
 		float fx, fy;
 		if(!SceneHooksRootForward(&fx, &fy)) return false;

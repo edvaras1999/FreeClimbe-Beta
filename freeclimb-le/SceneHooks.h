@@ -37,3 +37,7 @@ void SceneHooksSetTick(SceneTickCallback cb);
 
 // Mantem uma pose (movimento + fase 0..1) escrita no corpo a cada frame, ate ser desativada.
 void SceneHooksSetManualPose(bool active, int motion, float phase, float scaleY, float scaleZ);
+
+// ---- passo 21: reencontrar o esqueleto do jogador (o jogo reconstroi-o ao equipar, em combate, ao mudar de celula) ----
+// Volta a procurar a raiz e a tabela achatada do jogador e a ligar os ossos. Devolve true se ficou utilizavel.
+bool SceneHooksRefreshTarget();

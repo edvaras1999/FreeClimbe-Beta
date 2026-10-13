@@ -222,7 +222,7 @@ namespace
 				FromQuat(p + 3, local.r);
 				if(bone == 4 && g_restReady)											// centro do corpo: soma o deslocamento da pose
 				{
-					local.t[0] += (p[0] - g_rest[bone * 10 + 0]);
+					local.t[0] += (p[0] - g_rest[bone * 10 + 0]) * ((g_scaleY == 0.0f && g_scaleZ == 0.0f) ? 0.0f : 1.0f);
 					local.t[1] += (p[1] - g_rest[bone * 10 + 1]) * g_scaleY;			// para a frente, ajustado a borda
 					local.t[2] += (p[2] - g_rest[bone * 10 + 2]) * g_scaleZ;			// para cima, ajustado a borda
 				}
@@ -611,4 +611,83 @@ void SceneHooksSetManualPose(bool active, int motion, float phase, float scaleY,
 	g_scaleY = scaleY;
 	g_scaleZ = scaleZ;
 	InterlockedExchange(&g_manual, active ? 1 : 0);
+}
+
+// ----------------------------------------------------------------------------------------------
+// Reencontrar o esqueleto do jogador. Chamar na thread principal (ao carregar numa tecla).
+bool SceneHooksRefreshTarget()
+{
+	const unsigned kFlatVtable = 0x011186A4;						// BSFlattenedBoneTree
+
+	const unsigned player = ReadableMem(0x01310588, 4) ? *(const unsigned *)0x01310588 : 0;
+	if(!player || !ReadableMem(player, 4)) return false;
+	const unsigned vtable = *(const unsigned *)player;
+	if(!ReadableMem(vtable + 0x6F * 4, 4)) return false;
+
+	typedef unsigned (__thiscall * GetRoot_t)(void *, unsigned);
+	const GetRoot_t getRoot = (GetRoot_t)*(const unsigned *)(vtable + 0x6F * 4);
+	const unsigned root = getRoot((void *)player, 0);
+	if(!root || !ReadableMem(root, 0xC0)) return false;
+
+	// procura a tabela achatada entre os descendentes da raiz (poucos niveis)
+	unsigned flat = 0;
+	unsigned level[3][64]; unsigned count[3] = { 1, 0, 0 };
+	level[0][0] = root;
+	for(int depth = 0; depth < 3 && !flat; ++depth)
+	{
+		for(unsigned i = 0; i < count[depth] && !flat; ++i)
+		{
+			const unsigned node = level[depth][i];
+			if(!ReadableMem(node, 0xC0)) continue;
+			if(*(const unsigned *)node == kFlatVtable) { flat = node; break; }
+			if(depth == 2) continue;
+
+			const unsigned data = *(const unsigned *)(node + 0xAC);
+			const unsigned bound = *(const unsigned short *)(node + 0xB2);
+			if(!data || bound == 0 || bound > 64 || !ReadableMem(data, bound * 4)) continue;
+			for(unsigned c = 0; c < bound && count[depth + 1] < 64; ++c)
+			{
+				const unsigned child = *(const unsigned *)(data + 4 * c);
+				if(child) level[depth + 1][count[depth + 1]++] = child;
+			}
+		}
+	}
+	if(!flat) return false;
+
+	unsigned entries, n;
+	if(!FlatArray(flat, &entries, &n)) return false;
+
+	if(root == g_playerRoot && flat == g_playerFlat) return true;	// nada mudou
+
+	// ligar os ossos canonicos as entradas, pelo nome (sem distinguir maiusculas)
+	int map[99];
+	const int engineOwned[] = { 0, 1, 2, 3, 42, 43, 60, 61, 62, 63, 64, 65, 66, 97, 98 };
+	for(int bone = 0; bone < 99; ++bone)
+	{
+		map[bone] = -1;
+		bool skip = false;
+		for(size_t k = 0; k < sizeof(engineOwned) / sizeof(engineOwned[0]); ++k) if(engineOwned[k] == bone) skip = true;
+		if(skip) continue;
+
+		const char * name = FC_BoneName(bone);
+		for(unsigned i = 0; i < n; ++i)
+		{
+			const unsigned e = entries + i * 0x78;
+			if(!ReadableMem(e + 0x74, 4)) continue;
+			const unsigned chars = *(const unsigned *)(e + 0x74);
+			if(!chars || !ReadableMem(chars, 48)) continue;
+			if(_strnicmp((const char *)chars, name, 47) == 0 && ((const char *)chars)[strlen(name)] == 0) { map[bone] = (int)i; break; }
+		}
+	}
+
+	// trocar tudo de uma vez, sem a thread do esqueleto estar a meio de uma pose
+	for(int spin = 0; spin < 200 && InterlockedCompareExchange(&g_inPose, 1, 0) != 0; ++spin) Sleep(1);
+	unsigned bound = 0;
+	for(int bone = 0; bone < 99; ++bone) { g_boneEntry[bone] = map[bone]; if(map[bone] >= 0) ++bound; }
+	g_playerRoot = root;
+	g_playerFlat = flat;
+	InterlockedExchange(&g_inPose, 0);
+
+	_MESSAGE("pose engine: skeleton target refreshed - root %08X, flat table %08X (%u entries), %u of 99 bones bound", root, flat, n, bound);
+	return bound > 0;
 }
