@@ -38,6 +38,9 @@ namespace
 		int		faceWall;		// 1 = vira o personagem de frente para a parede enquanto agarrado
 		float	hopScale;		// multiplica a distancia dos saltos na parede (1 = a da animacao)
 		float	hopSpeed;		// multiplica a velocidade dos saltos (1 = a duracao da animacao)
+		float	attachReach;	// distancia maxima a parede para se agarrar (o personagem e puxado ate ela)
+		int		hopEase;		// 1 = salto suave (comeca e acaba devagar); 0 = velocidade constante
+		int		warp;			// 1 = o controlador e teletransportado a cada frame; 0 = tenta mover sem "warp" (camara mais suave?)
 	};
 	Config g_cfg;
 
@@ -49,7 +52,8 @@ namespace
 		g_cfg.headHeight = 125.0f;
 		g_cfg.alwaysCling = 1;
 		g_cfg.faceWall = 1;
-		g_cfg.hopScale = 1.4f;	g_cfg.hopSpeed = 1.3f;
+		g_cfg.hopScale = 1.8f;	g_cfg.hopSpeed = 1.1f;
+		g_cfg.attachReach = 65.0f;	g_cfg.hopEase = 1;	g_cfg.warp = 1;
 	}
 
 	bool ReadWholeFile(const char * path, std::string * out)
@@ -115,11 +119,14 @@ namespace
 			else if(KeyIs(key, "FaceWall"))		g_cfg.faceWall = atoi(value.c_str());
 			else if(KeyIs(key, "HopScale"))		g_cfg.hopScale = f;
 			else if(KeyIs(key, "HopSpeed"))		g_cfg.hopSpeed = f;
+			else if(KeyIs(key, "AttachReach"))	g_cfg.attachReach = f;
+			else if(KeyIs(key, "HopEase"))		g_cfg.hopEase = atoi(value.c_str());
+			else if(KeyIs(key, "Warp"))			g_cfg.warp = atoi(value.c_str());
 		}
 
-		_MESSAGE("gameplay: settings: reach %.0f, wall gap %.0f, speeds up/down/side %.0f/%.0f/%.0f, ledge %.0f-%.0f, head %.0f, alwaysCling %d, faceWall %d, hop scale/speed %.2f/%.2f",
+		_MESSAGE("gameplay: settings: reach %.0f, wall gap %.0f, speeds up/down/side %.0f/%.0f/%.0f, ledge %.0f-%.0f, head %.0f, alwaysCling %d, faceWall %d, hop scale/speed %.2f/%.2f, attach reach %.0f, ease %d, warp %d",
 				 (double)g_cfg.reach, (double)g_cfg.gap, (double)g_cfg.climbSpeed, (double)g_cfg.downSpeed, (double)g_cfg.sideSpeed,
-				 (double)g_cfg.minLedge, (double)g_cfg.maxLedge, (double)g_cfg.headHeight, g_cfg.alwaysCling, g_cfg.faceWall, (double)g_cfg.hopScale, (double)g_cfg.hopSpeed);
+				 (double)g_cfg.minLedge, (double)g_cfg.maxLedge, (double)g_cfg.headHeight, g_cfg.alwaysCling, g_cfg.faceWall, (double)g_cfg.hopScale, (double)g_cfg.hopSpeed, (double)g_cfg.attachReach, g_cfg.hopEase, g_cfg.warp);
 	}
 
 	// ------------------------------------------------------------------ estado
@@ -171,7 +178,7 @@ namespace
 		const float scale = Engine::HavokScale();
 		__declspec(align(16)) float target[4];
 		target[0] = x * scale; target[1] = y * scale; target[2] = z * scale; target[3] = 0.0f;
-		Engine::ControllerSetPosition(ctrl, target, true, true);
+		Engine::ControllerSetPosition(ctrl, target, true, g_cfg.warp != 0);
 
 		__declspec(align(16)) float stop[4] = { 0, 0, 0, 0 };
 		Engine::ControllerSetLinearVelocity(ctrl, stop);			// sem gravidade nem inercia enquanto agarrado
@@ -204,6 +211,19 @@ namespace
 			}
 		}
 		return best;
+	}
+
+	// Ate onde se pode ir a partir de (px,py,pz+h) na direcao (dx,dy,dz) (unitaria), em 'maxDist': devolve a distancia
+	// livre (maxDist se nada a bloqueia). Testa a varias alturas e fica com a mais curta.
+	float FreeDistance(Actor * player, float px, float py, float pz, float dx, float dy, float dz, float maxDist, const float * heights, int count)
+	{
+		float free = maxDist;
+		for(int k = 0; k < count; ++k)
+		{
+			const Havok::Result r = Havok::RayCast(NiPoint3(px, py, pz + heights[k]), NiPoint3(dx, dy, dz), maxDist, Havok::kLayer_Transparent, player);
+			if(r.didHit && r.distance < free) free = r.distance;
+		}
+		return free;
 	}
 
 	struct Ledge { float wallDistance, height, topZ; };
@@ -306,8 +326,13 @@ namespace
 	{
 		const NiPoint3 feet = Engine::Position(player);
 		static const float heights[3] = { 55.0f, 95.0f, 135.0f };
-		const WallHit wall = ProbeWall(player, fx, fy, feet.x, feet.y, feet.z, g_cfg.reach, heights, 3);
+		const WallHit wall = ProbeWall(player, fx, fy, feet.x, feet.y, feet.z, g_cfg.attachReach, heights, 3);
 		if(!wall.found) return false;
+
+		// o personagem e puxado ate a parede: o caminho tem de estar livre tambem a altura dos joelhos
+		static const float low[1] = { 25.0f };
+		const float lowFree = FreeDistance(player, feet.x, feet.y, feet.z, fx, fy, 0.0f, wall.dist, low, 1);
+		if(lowFree < wall.dist - 8.0f) { _MESSAGE("gameplay: not clinging - an obstacle is in the way at knee height"); return false; }
 
 		g_n[0] = wall.nx; g_n[1] = wall.ny;
 		g_pos[0] = wall.x + g_n[0] * g_cfg.gap;
@@ -334,10 +359,28 @@ namespace
 		if(secs <= 0.0f) { Release("hop animation not available"); return; }
 
 		const float rx = -g_n[1], ry = g_n[0];									// a direita ao longo da parede
+		float dxs = rx * lateral * g_cfg.hopScale, dys = ry * lateral * g_cfg.hopScale, dzs = vertical * g_cfg.hopScale;
+
+		// o caminho do salto tem de estar livre: se algo o bloqueia, o salto encurta (ou nao acontece)
+		const float total = sqrtf(dxs * dxs + dys * dys + dzs * dzs);
+		if(total > 1.0f)
+		{
+			static const float body[3] = { 30.0f, 75.0f, 120.0f };
+			const float free = FreeDistance(ThePlayer(), g_pos[0], g_pos[1], g_pos[2], dxs / total, dys / total, dzs / total, total + 25.0f, body, 3);
+			if(free < total + 25.0f)
+			{
+				const float allowed = free - 25.0f;
+				if(allowed < 25.0f) { _MESSAGE("gameplay: hop blocked by an obstacle - staying on the wall"); return; }
+				const float k = allowed / total;
+				dxs *= k; dys *= k; dzs *= k;
+				_MESSAGE("gameplay: hop shortened by an obstacle (%.0f%%)", (double)(k * 100.0f));
+			}
+		}
+
 		g_hopFrom[0] = g_pos[0]; g_hopFrom[1] = g_pos[1]; g_hopFrom[2] = g_pos[2];
-		g_hopTo[0] = g_pos[0] + rx * lateral * g_cfg.hopScale;
-		g_hopTo[1] = g_pos[1] + ry * lateral * g_cfg.hopScale;
-		g_hopTo[2] = g_pos[2] + vertical * g_cfg.hopScale;
+		g_hopTo[0] = g_pos[0] + dxs;
+		g_hopTo[1] = g_pos[1] + dys;
+		g_hopTo[2] = g_pos[2] + dzs;
 		g_hopMotion = motion;
 		g_hopSecs = secs / (g_cfg.hopSpeed > 0.1f ? g_cfg.hopSpeed : 1.0f);
 		g_hopStart = g_lastTick = GetTickCount();
@@ -352,7 +395,7 @@ namespace
 	{
 		float p = (float)(now - g_hopStart) / 1000.0f / g_hopSecs;
 		if(p > 1.0f) p = 1.0f;
-		const float e = p * p * (3.0f - 2.0f * p);								// suave no inicio e no fim
+		const float e = g_cfg.hopEase ? p * p * (3.0f - 2.0f * p) : p;			// suave no inicio e no fim (ou constante)
 
 		for(int k = 0; k < 3; ++k) g_pos[k] = g_hopFrom[k] + (g_hopTo[k] - g_hopFrom[k]) * e;
 		if(g_cfg.faceWall) Engine::Rotation(player).z = atan2f(-g_n[0], -g_n[1]);
@@ -363,7 +406,14 @@ namespace
 		// aterragem: ha parede aqui? Se sim, volta a agarrar-se; se nao, o salto falhou e cai.
 		static const float chest[1] = { 70.0f };
 		const WallHit w = ProbeWall(player, -g_n[0], -g_n[1], g_pos[0], g_pos[1], g_pos[2], g_cfg.gap + 50.0f, chest, 1);
-		if(!w.found) { Release("the hop missed the wall"); return; }
+		if(!w.found)
+		{
+			// aterrou acima do topo da parede: se foi um salto para cima, passa por cima da borda em vez de cair
+			const char * why = "";
+			if(g_hopMotion == kHopUp && StartMantle(player, -g_n[0], -g_n[1], g_pos[0], g_pos[1], g_pos[2], &why)) return;
+			Release("the hop missed the wall");
+			return;
+		}
 
 		g_n[0] = w.nx; g_n[1] = w.ny;
 		g_pos[0] = w.x + g_n[0] * g_cfg.gap;
@@ -441,6 +491,21 @@ namespace
 				vt = 0.0f;
 				_MESSAGE("gameplay: inner corner - switched to the next wall");
 			}
+		}
+
+		// nao atravessar tetos nem obstaculos: o movimento so avanca ate onde esta livre
+		if(vz > 0.0f)
+		{
+			static const float headTop[1] = { 0.0f };
+			const float room = FreeDistance(player, g_pos[0], g_pos[1], g_pos[2] + g_cfg.headHeight, 0.0f, 0.0f, 1.0f, vz * dt + 12.0f, headTop, 1);
+			if(room < vz * dt + 12.0f) vz = 0.0f;										// ha um teto/borda por cima
+		}
+		if(vt != 0.0f)
+		{
+			static const float sideH[3] = { 30.0f, 70.0f, 120.0f };
+			const float tx = (vt > 0.0f) ? -g_n[1] : g_n[1], ty = (vt > 0.0f) ? g_n[0] : -g_n[0];
+			const float room = FreeDistance(player, g_pos[0], g_pos[1], g_pos[2], tx, ty, 0.0f, fabsf(vt) * dt + 20.0f, sideH, 3);
+			if(room < fabsf(vt) * dt + 20.0f) vt = 0.0f;								// obstaculo ao lado (a parede em L e tratada acima)
 		}
 
 		// onde fica o personagem agora: sobe/desce em z e anda de lado ao longo da parede (a direita = (-ny, nx))
