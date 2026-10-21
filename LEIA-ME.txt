@@ -1,31 +1,46 @@
-FREECLIMB LE - PASSO 23: COLISOES, TOPO APOS O SALTO E MAIS AFINACOES
+FREECLIMB LE - PASSO 24: TODAS AS FUNCOES LIGADAS (como o mod original)
 
-O QUE O LOG DO PASSO 22 MOSTROU E O QUE MUDEI
- 1) "Hop missed the wall" muito frequente: o salto para CIMA sobe e aterra ACIMA do topo da parede, nao ha
-    parede, e o plugin largava (caia). AGORA: se aterra acima do topo, passa POR CIMA da borda.
- 2) Atravessar paredes: um agarrar encontrou uma parede a 108 unidades e puxou o personagem 78 unidades de
-    uma so vez; os saltos laterais tambem nao verificavam o caminho. AGORA:
-    - AttachReach=65: so agarra a menos de 65 unidades (antes 110) e o caminho ao nivel dos joelhos tem de estar livre.
-    - Os SALTOS verificam o caminho com raios a tres alturas: se algo bloqueia, o salto ENCURTA (ou nao acontece
-      e o personagem continua agarrado). Subir verifica tetos; andar de lado verifica obstaculos.
- 3) "Escalar ar": provavelmente consequencia de 2 (ficar atras de uma superficie e o raio apanhar uma parede
-    invisivel ou o verso de outra). Veremos se desaparece.
+CONTROLOS (usam as teclas do PROPRIO jogo: se mudou W/A/S/D/Shift/Espaco/Ctrl no jogo, seguem essas)
+ ENTRAR NA PAREDE
+   Salto + W + A + D (premidos JUNTOS)   junto a uma parede  -> apanha a parede
+        a pe:  "reach" (se ja esta colado a parede) ou "jumpCatch"
+   O mesmo A MEIO DE UM SALTO perto de uma parede:  "jumpCatch" / "ledgeCatch" (se ha borda) /
+        "sprintCatch" (se estava a correr com Shift)
+   (Se preferir entrar so com Salto: EntryMode=0 no .ini)
+ NA PAREDE
+   W / S / A / D           sobe / desce / anda de lado
+   Shift + direcao         CORRE na parede (runUp, runLeft, runRight, diagonais), com as animacoes de
+                           arranque (runLaunch*) e de paragem (runCatch)
+   Salto + W/A/D           salta para cima / esquerda / direita
+   Salto + S               empurra-se para longe (backFlipOut, cambalhota para tras)
+   A + S + D + Salto       larga no sitio (animacao drop)
+   Agachar                 larga (extra desta versao)
+   Chegar ao topo          passa POR CIMA da borda (contextMantle), com a camara e armas a acompanhar
+   Fim da parede de lado   canto exterior/interior: da a volta; sem canto mas com outra parede ao alcance
+                           de um salto: SALTA SOZINHO para ela (contextHopLeft/Right)
 
-AFINACOES NOVAS NO .ini (copie de novo o FreeClimbLE.ini deste pacote; e relido a cada vez que se agarra):
-   HopScale=1.8   (era 1.4) distancia dos saltos: "muito curtos" -> maiores. Mais = mais longe.
-   HopSpeed=1.1   (era 1.3) velocidade dos saltos: mais baixo = mais lento e mais natural.
-   HopEase=1      suave no inicio e fim; ponha 0 se parecer "mole"
-   AttachReach=65 alcance para agarrar
-   Warp=1         se a CAMARA parecer atrasada, experimente Warp=0 e diga-me o que mudou.
+NOVO NO .ini (copie de novo o FreeClimbLE.ini): EntryMode, AirReach, WallRunSpeed, WallRunDiagonal,
+ ContextHops, CatchSpeed. Todos relidos a cada vez que se agarra: afine sem recompilar.
+
+CORRECAO: a recusa de agarrar "obstaculo a altura dos joelhos" era rigorosa de mais (entulho e declives
+ na base das paredes). Agora so conta um obstaculo tipo parede claramente antes da parede.
+
+AINDA NAO LIGADO (e porque):
+ - Stamina: o Freerun LE nao tem as funcoes de stamina verificadas; fica para um passo proprio.
+ - Manipulo analogico (comando): so teclado/rato por agora; os botoes do comando que o jogo mapeia
+   para Salto/Sprint/Agachar ja funcionam, mas o stick de movimento nao e lido.
+ - Pontapes e cambalhotas por cima de obstaculos durante a corrida (kickUp/kickLeft/kickRight, flip*).
+ - Menu de opcoes dentro do jogo: o .ini faz esse papel.
+ - As 5 atualizacoes mais recentes do mod original (compatibilidade de esqueletos, estabilidade na parede).
 
 COMO FAZER (igual aos passos anteriores)
- GitHub: arraste a pasta "freeclimb-le" > Commit; Actions > Run workflow; baixe o resultado;
- troque a FreeClimbLE.dll em Data\SKSE\Plugins; copie o FreeClimbLE.ini. Carregue o save e espere ~1 minuto.
+ GitHub: arraste a pasta "freeclimb-le" > Commit; Actions > Run workflow; baixe o resultado; troque a
+ FreeClimbLE.dll; copie o FreeClimbLE.ini. Carregue o save e espere ~1 minuto.
 
-TESTES
- a) Salto + W numa parede de ~1,5 a 2 m: agora passa por cima do topo em vez de cair?
- b) Tente atravessar uma parede de proposito (agarrar-se perto de um canto/porta/obstaculo): ja nao atravessa?
- c) Saltos laterais: o tamanho e a velocidade parecem melhores? Ajuste HopScale/HopSpeed no .ini e diga os
-    valores que ficaram bons.
- d) Mude Warp=0 e veja se a camara segue melhor (ou se algo parte).
- Envie o FreeClimbLE.log e diga em palavras o que correu mal.
+TESTES (por ordem; diga-me o que falha, de forma simples)
+ a) Entrar: Salto+W+A+D junto a uma parede, a pe. Apanha? Se for dificil de premir, EntryMode=0.
+ b) Entrar no ar: salte para uma parede, carregue Salto+W+A+D no ar. Apanha? Com Shift (sprintCatch)?
+ c) Correr na parede: segure Shift + W, + A, + D, + W+A, + W+D. Anda a boa velocidade? Animacao certa?
+ d) Largar: S+Salto (cambalhota para tras), A+S+D+Salto (no sitio), Agachar.
+ e) Saltos contextuais: ande de lado ate ao fim de uma parede com outra ao alcance (dois pilares).
+ Envie o FreeClimbLE.log.

@@ -41,6 +41,11 @@ namespace
 		float	attachReach;	// distancia maxima a parede para se agarrar (o personagem e puxado ate ela)
 		int		hopEase;		// 1 = salto suave (comeca e acaba devagar); 0 = velocidade constante
 		int		warp;			// 1 = o controlador e teletransportado a cada frame; 0 = tenta mover sem "warp" (camara mais suave?)
+		int		entryMode;		// 0 = Salto sozinho junto a uma parede; 1 = Salto + W + A + D juntos (como o mod original)
+		float	airReach;		// alcance para apanhar uma parede a meio de um salto
+		float	wallRunSpeed, wallRunDiag;	// corrida na parede (Shift) e multiplicador na diagonal
+		int		contextHops;	// 1 = salta sozinho para a parede seguinte quando a atual acaba a andar de lado
+		float	catchSpeed;		// multiplica a velocidade da animacao de apanhar a parede
 	};
 	Config g_cfg;
 
@@ -54,6 +59,8 @@ namespace
 		g_cfg.faceWall = 1;
 		g_cfg.hopScale = 1.8f;	g_cfg.hopSpeed = 1.1f;
 		g_cfg.attachReach = 65.0f;	g_cfg.hopEase = 1;	g_cfg.warp = 1;
+		g_cfg.entryMode = 1;	g_cfg.airReach = 90.0f;	g_cfg.wallRunSpeed = 379.5f;	g_cfg.wallRunDiag = 1.15f;
+		g_cfg.contextHops = 1;	g_cfg.catchSpeed = 1.5f;
 	}
 
 	bool ReadWholeFile(const char * path, std::string * out)
@@ -122,6 +129,12 @@ namespace
 			else if(KeyIs(key, "AttachReach"))	g_cfg.attachReach = f;
 			else if(KeyIs(key, "HopEase"))		g_cfg.hopEase = atoi(value.c_str());
 			else if(KeyIs(key, "Warp"))			g_cfg.warp = atoi(value.c_str());
+			else if(KeyIs(key, "EntryMode"))	g_cfg.entryMode = atoi(value.c_str());
+			else if(KeyIs(key, "AirReach"))		g_cfg.airReach = f;
+			else if(KeyIs(key, "WallRunSpeed"))	g_cfg.wallRunSpeed = f;
+			else if(KeyIs(key, "WallRunDiagonal"))	g_cfg.wallRunDiag = f;
+			else if(KeyIs(key, "ContextHops"))	g_cfg.contextHops = atoi(value.c_str());
+			else if(KeyIs(key, "CatchSpeed"))	g_cfg.catchSpeed = f;
 		}
 
 		_MESSAGE("gameplay: settings: reach %.0f, wall gap %.0f, speeds up/down/side %.0f/%.0f/%.0f, ledge %.0f-%.0f, head %.0f, alwaysCling %d, faceWall %d, hop scale/speed %.2f/%.2f, attach reach %.0f, ease %d, warp %d",
@@ -130,7 +143,7 @@ namespace
 	}
 
 	// ------------------------------------------------------------------ estado
-	enum State { kIdle = 0, kCling = 1, kTopOut = 2, kHop = 3 };
+	enum State { kIdle = 0, kCling = 1, kTopOut = 2, kHop = 3, kCatch = 4 };
 
 	// os movimentos do pacote do FreeClimb
 	const int	kHang = 1, kUp = 2, kDown = 3, kLeft = 4, kRight = 5, kMantle = 42;
@@ -138,6 +151,11 @@ namespace
 	const float	kSideNatural = 42.3f / 1.17f;		// idem "left"/"right"
 	const float	kMantleForward = 62.9f, kMantleUp = 132.3f;
 	const int	kHopLeft = 9, kHopRight = 10, kHopUp = 11;
+	const int	kReach = 8, kDrop = 15, kJumpCatch = 16, kSprintCatch = 17, kLedgeCatch = 19;
+	const int	kRunUp = 20, kRunLeft = 21, kRunRight = 22, kRunDiagLeft = 23, kRunDiagRight = 24, kRunLaunch = 25, kRunCatch = 26;
+	const int	kRunLaunchLeft = 34, kRunLaunchRight = 35, kBackFlipOut = 37, kCtxHopLeft = 40, kCtxHopRight = 41;
+	const float	kRunNatural = 267.9f / 0.63f;				// velocidade natural dos ciclos de corrida
+	const float	kCtxHopDist = 104.0f;
 	const float	kHopLeftDist = -105.3f, kHopRightDist = 93.7f, kHopUpDist = 55.1f;		// deslocamento das animacoes
 
 	volatile LONG	g_state = kIdle;
@@ -149,12 +167,17 @@ namespace
 	float			g_destX = 0, g_destY = 0, g_destZ = 0;
 	DWORD			g_mantleStart = 0, g_hopStart = 0;
 	int				g_hopMotion = 0;
+	float			g_hopCom = 1.0f;
+	DWORD			g_catchStart = 0, g_bridgeStart = 0, g_dropStart = 0;
+	int				g_catchMotion = 0, g_bridgeMotion = 0, g_dropMotion = 0;
+	float			g_catchSecs = 1.0f, g_bridgeSecs = 0.0f, g_dropSecs = 0.0f, g_catchFrom[3], g_catchTo[3];
+	bool			g_wasRun = false;
 	float			g_hopSecs = 1.0f, g_hopFrom[3], g_hopTo[3];
 	float			g_mantleStartPos[3], g_mantleDir[2], g_mantleScaleY = 1.0f, g_mantleScaleZ = 1.0f, g_mantleSecs = 1.87f;
 	float			g_rest[99 * 10], g_buf[99 * 10];
 	bool			g_restOk = false;
 
-	struct InputState { volatile LONG forward, back, left, right, jumpEdge, sneakEdge; };
+	struct InputState { volatile LONG forward, back, left, right, sprint, jumpEdge, sneakEdge; };
 	InputState g_in;
 
 	NiPoint3 Add(const NiPoint3 & a, const NiPoint3 & b)	{ return NiPoint3(a.x + b.x, a.y + b.y, a.z + b.z); }
@@ -322,38 +345,117 @@ namespace
 		_MESSAGE("gameplay: released from the wall (%s)", why);
 	}
 
-	bool StartCling(Actor * player, void * ctrl, float fx, float fy)
+	// O estado "agarrado", a partir da posicao (g_pos) e da normal (g_n) atuais.
+	void EnterCling()
 	{
-		const NiPoint3 feet = Engine::Position(player);
-		static const float heights[3] = { 55.0f, 95.0f, 135.0f };
-		const WallHit wall = ProbeWall(player, fx, fy, feet.x, feet.y, feet.z, g_cfg.attachReach, heights, 3);
-		if(!wall.found) return false;
-
-		// o personagem e puxado ate a parede: o caminho tem de estar livre tambem a altura dos joelhos
-		static const float low[1] = { 25.0f };
-		const float lowFree = FreeDistance(player, feet.x, feet.y, feet.z, fx, fy, 0.0f, wall.dist, low, 1);
-		if(lowFree < wall.dist - 8.0f) { _MESSAGE("gameplay: not clinging - an obstacle is in the way at knee height"); return false; }
-
-		g_n[0] = wall.nx; g_n[1] = wall.ny;
-		g_pos[0] = wall.x + g_n[0] * g_cfg.gap;
-		g_pos[1] = wall.y + g_n[1] * g_cfg.gap;
-		g_pos[2] = feet.z;
-
-		PlaceController(ctrl, g_pos[0], g_pos[1], g_pos[2]);
-		if(g_cfg.faceWall) Engine::Rotation(player).z = atan2f(-g_n[0], -g_n[1]);
-
-		g_phase = 0.0f; g_motion = kHang;
+		g_phase = 0.0f; g_motion = kHang; g_wasRun = false; g_bridgeSecs = 0.0f;
 		g_attachTime = g_lastTick = GetTickCount();
 		g_in.jumpEdge = 0; g_in.sneakEdge = 0;
 		SceneHooksSetManualPose(true, kHang, 0.0f, 1.0f, 1.0f);
 		InterlockedExchange(&g_state, kCling);
+	}
 
-		_MESSAGE("gameplay: CLINGING to the wall (%.0f units ahead). W/S climb, A/D sidestep, Jump or Sneak lets go.", (double)wall.dist);
+	// Chegou a parede (fim de um salto ou de uma animacao de apanhar): se ha parede aqui, agarra-se; senao, larga.
+	void LandOnWall(Actor * player, void * ctrl, bool afterUpHop)
+	{
+		static const float chest[1] = { 70.0f };
+		const WallHit w = ProbeWall(player, -g_n[0], -g_n[1], g_pos[0], g_pos[1], g_pos[2], g_cfg.gap + 50.0f, chest, 1);
+		if(!w.found)
+		{
+			// aterrou acima do topo da parede: se foi um salto para cima, passa por cima da borda em vez de cair
+			const char * why = "";
+			if(afterUpHop && StartMantle(player, -g_n[0], -g_n[1], g_pos[0], g_pos[1], g_pos[2], &why)) return;
+			Release("missed the wall");
+			return;
+		}
+
+		g_n[0] = w.nx; g_n[1] = w.ny;
+		g_pos[0] = w.x + g_n[0] * g_cfg.gap;
+		g_pos[1] = w.y + g_n[1] * g_cfg.gap;
+		PlaceController(ctrl, g_pos[0], g_pos[1], g_pos[2]);
+		EnterCling();
+	}
+
+	// Entrada na parede: o personagem e levado ate ela enquanto toca a animacao de apanhar (reach, jumpCatch, ...).
+	void BeginCatch(int motion, const WallHit & wall, float fromX, float fromY, float fromZ)
+	{
+		const float secs = FC_MotionSeconds(motion);
+		g_n[0] = wall.nx; g_n[1] = wall.ny;
+		g_catchFrom[0] = fromX; g_catchFrom[1] = fromY; g_catchFrom[2] = fromZ;
+		g_catchTo[0] = wall.x + g_n[0] * g_cfg.gap;
+		g_catchTo[1] = wall.y + g_n[1] * g_cfg.gap;
+		g_catchTo[2] = fromZ;
+		g_catchMotion = motion;
+		g_catchSecs = (secs > 0.0f ? secs : 0.1f) / (g_cfg.catchSpeed > 0.2f ? g_cfg.catchSpeed : 1.0f);
+		g_catchStart = g_lastTick = GetTickCount();
+		g_pos[0] = fromX; g_pos[1] = fromY; g_pos[2] = fromZ;
+
+		g_in.jumpEdge = 0; g_in.sneakEdge = 0;
+		SceneHooksSetManualPose(true, motion, 0.0f, 0.0f, 0.0f);				// so rotacoes: o personagem move-se mesmo
+		InterlockedExchange(&g_state, kCatch);
+	}
+
+	void TickCatch(Actor * player, void * ctrl, DWORD now)
+	{
+		float p = (float)(now - g_catchStart) / 1000.0f / g_catchSecs;
+		if(p > 1.0f) p = 1.0f;
+		const float e = p * p * (3.0f - 2.0f * p);
+		for(int k = 0; k < 3; ++k) g_pos[k] = g_catchFrom[k] + (g_catchTo[k] - g_catchFrom[k]) * e;
+
+		if(g_cfg.faceWall) Engine::Rotation(player).z = atan2f(-g_n[0], -g_n[1]);
+		PlaceController(ctrl, g_pos[0], g_pos[1], g_pos[2]);
+		SceneHooksSetManualPose(true, g_catchMotion, p, 0.0f, 0.0f);
+		if(p >= 1.0f) LandOnWall(player, ctrl, false);
+	}
+
+	// Procura a parede e, se a encontra, comeca a apanha-la. 'air' = a meio de um salto.
+	bool StartEntry(Actor * player, float fx, float fy, bool air)
+	{
+		const NiPoint3 feet = Engine::Position(player);
+		static const float heights[3] = { 55.0f, 95.0f, 135.0f };
+		const WallHit wall = ProbeWall(player, fx, fy, feet.x, feet.y, feet.z, air ? g_cfg.airReach : g_cfg.attachReach, heights, 3);
+		if(!wall.found) return false;
+
+		if(!air)
+		{
+			// um obstaculo REAL (parede, pilar) a altura dos joelhos e claramente antes da parede: nao agarra.
+			// (Declives e entulho baixo nao contam.)
+			const Havok::Result low = Havok::RayCast(NiPoint3(feet.x, feet.y, feet.z + 25.0f), NiPoint3(fx, fy, 0.0f), wall.dist, Havok::kLayer_Transparent, player);
+			if(low.didHit && fabsf(low.normal.z) < 0.5f && low.distance < wall.dist - 15.0f)
+			{
+				_MESSAGE("gameplay: not clinging - a wall-like obstacle is in the way at knee height");
+				return false;
+			}
+		}
+
+		int motion;
+		if(air)
+		{
+			motion = g_in.sprint ? kSprintCatch : kJumpCatch;
+			Ledge ledge; const char * why = "";
+			if(!g_in.sprint && FindLedge(player, fx, fy, feet.x, feet.y, feet.z, &ledge, &why)) motion = kLedgeCatch;
+		}
+		else motion = (wall.dist <= 48.0f) ? kReach : kJumpCatch;
+
+		BeginCatch(motion, wall, feet.x, feet.y, feet.z);
+		_MESSAGE("gameplay: CATCHING the wall (%s, %.0f units ahead) with animation %d. W/S climb, A/D sidestep, Shift = wall run.",
+				 air ? "in the air" : "from the ground", (double)wall.dist, motion);
 		return true;
 	}
 
+	// Largar com uma animacao: o personagem cai (ou e empurrado) enquanto o corpo toca drop/backFlipOut.
+	void StartDrop(int motion, float pushSpeed, const char * why)
+	{
+		Release(why, pushSpeed);
+		const float secs = FC_MotionSeconds(motion);
+		if(secs <= 0.0f) return;
+		g_dropMotion = motion; g_dropStart = GetTickCount(); g_dropSecs = secs;
+		SceneHooksSetManualPose(true, motion, 0.0f, 0.0f, 0.0f);
+	}
+
 	// ------------------------------------------------------------------ saltos na parede (movimento + salto)
-	void StartHop(int motion, float lateral, float vertical)
+	// 'context' = salto automatico entre paredes: o centro do corpo nao e deslocado pela animacao (o personagem move-se mesmo).
+	void StartHop(int motion, float lateral, float vertical, bool context = false)
 	{
 		const float secs = FC_MotionSeconds(motion);
 		if(secs <= 0.0f) { Release("hop animation not available"); return; }
@@ -382,12 +484,13 @@ namespace
 		g_hopTo[1] = g_pos[1] + dys;
 		g_hopTo[2] = g_pos[2] + dzs;
 		g_hopMotion = motion;
+		g_hopCom = context ? 0.0f : 1.0f;
 		g_hopSecs = secs / (g_cfg.hopSpeed > 0.1f ? g_cfg.hopSpeed : 1.0f);
 		g_hopStart = g_lastTick = GetTickCount();
 
-		SceneHooksSetManualPose(true, motion, 0.0f, 1.0f, 1.0f);
+		SceneHooksSetManualPose(true, motion, 0.0f, g_hopCom, g_hopCom);
 		InterlockedExchange(&g_state, kHop);
-		_MESSAGE("gameplay: HOP (%s) %.0f units", motion == kHopUp ? "up" : (lateral < 0.0f ? "left" : "right"),
+		_MESSAGE("gameplay: HOP (%s%s) %.0f units", context ? "automatic, " : "", motion == kHopUp ? "up" : (lateral < 0.0f ? "left" : "right"),
 				 (double)(fabsf(lateral) + fabsf(vertical)) * g_cfg.hopScale);
 	}
 
@@ -400,38 +503,37 @@ namespace
 		for(int k = 0; k < 3; ++k) g_pos[k] = g_hopFrom[k] + (g_hopTo[k] - g_hopFrom[k]) * e;
 		if(g_cfg.faceWall) Engine::Rotation(player).z = atan2f(-g_n[0], -g_n[1]);
 		PlaceController(ctrl, g_pos[0], g_pos[1], g_pos[2]);
-		SceneHooksSetManualPose(true, g_hopMotion, p, 1.0f, 1.0f);
-		if(p < 1.0f) return;
-
-		// aterragem: ha parede aqui? Se sim, volta a agarrar-se; se nao, o salto falhou e cai.
-		static const float chest[1] = { 70.0f };
-		const WallHit w = ProbeWall(player, -g_n[0], -g_n[1], g_pos[0], g_pos[1], g_pos[2], g_cfg.gap + 50.0f, chest, 1);
-		if(!w.found)
-		{
-			// aterrou acima do topo da parede: se foi um salto para cima, passa por cima da borda em vez de cair
-			const char * why = "";
-			if(g_hopMotion == kHopUp && StartMantle(player, -g_n[0], -g_n[1], g_pos[0], g_pos[1], g_pos[2], &why)) return;
-			Release("the hop missed the wall");
-			return;
-		}
-
-		g_n[0] = w.nx; g_n[1] = w.ny;
-		g_pos[0] = w.x + g_n[0] * g_cfg.gap;
-		g_pos[1] = w.y + g_n[1] * g_cfg.gap;
-		PlaceController(ctrl, g_pos[0], g_pos[1], g_pos[2]);
-
-		g_phase = 0.0f; g_motion = kHang;
-		g_attachTime = g_lastTick = now;
-		g_in.jumpEdge = 0; g_in.sneakEdge = 0;
-		SceneHooksSetManualPose(true, kHang, 0.0f, 1.0f, 1.0f);
-		InterlockedExchange(&g_state, kCling);
-		_MESSAGE("gameplay: hop landed - clinging again");
+		SceneHooksSetManualPose(true, g_hopMotion, p, g_hopCom, g_hopCom);
+		if(p >= 1.0f) { _MESSAGE("gameplay: hop landing"); LandOnWall(player, ctrl, g_hopMotion == kHopUp); }
 	}
 
 	// A cada atualizacao do esqueleto do jogador (thread de trabalho do jogo).
 	void OnTick()
 	{
-		if(g_state == kIdle) return;
+		if(g_state == kIdle)
+		{
+			// a animacao de largar (drop / backFlipOut) acaba sozinha
+			if(g_dropMotion)
+			{
+				const float ph = (float)(GetTickCount() - g_dropStart) / 1000.0f / g_dropSecs;
+				if(ph >= 1.0f) { SceneHooksSetManualPose(false, kHang, 0, 1, 1); g_dropMotion = 0; }
+				else SceneHooksSetManualPose(true, g_dropMotion, ph, 0.0f, 0.0f);
+			}
+
+			// apanhar uma parede a meio de um salto: salto premido no ar (com a combinacao de entrada, se configurada)
+			if(InterlockedExchange(&g_in.jumpEdge, 0) && !g_dropMotion)
+			{
+				Actor * player = ThePlayer();
+				float fx, fy;
+				if(player && Engine::PlayerIsInMidair() && SceneHooksRootForward(&fx, &fy))
+				{
+					LoadConfig();
+					const bool combo = (g_cfg.entryMode == 0) || (g_in.forward && g_in.left && g_in.right);
+					if(combo) StartEntry(player, fx, fy, true);
+				}
+			}
+			return;
+		}
 
 		Actor * player = ThePlayer();
 		void * ctrl = player ? Engine::CharController(player) : NULL;
@@ -440,6 +542,7 @@ namespace
 		const DWORD now = GetTickCount();
 		if(g_state == kTopOut) { g_lastTick = now; TickMantle(ctrl, now); return; }
 		if(g_state == kHop) { g_lastTick = now; TickHop(player, ctrl, now); return; }
+		if(g_state == kCatch) { g_lastTick = now; TickCatch(player, ctrl, now); return; }
 
 		float dt = (float)(now - g_lastTick) / 1000.0f;
 		if(dt > 0.1f) dt = 0.1f;
@@ -452,22 +555,43 @@ namespace
 
 		if(now - g_attachTime > 400 && (jump || sneak))
 		{
-			if(sneak && !jump)	{ Release("sneak"); return; }
-			// Salto com direcao: salta nessa direcao. S + Salto: empurra-se para longe. Salto sozinho: larga no sitio.
+			if(sneak && !jump)	{ StartDrop(kDrop, 0.0f, "sneak"); return; }
+			// Como no mod original: A+S+D + Salto larga no sitio; direcao + Salto salta; S + Salto empurra-se para longe.
+			if(g_in.back && g_in.left && g_in.right)	{ StartDrop(kDrop, 0.0f, "let go in place"); return; }
 			if(up)			{ StartHop(kHopUp, 0.0f, kHopUpDist); return; }
 			if(left)		{ StartHop(kHopLeft, kHopLeftDist, 0.0f); return; }
 			if(right)		{ StartHop(kHopRight, kHopRightDist, 0.0f); return; }
-			if(down)		{ Release("pushed away from the wall", 170.0f); return; }
-			Release("let go in place", 0.0f);
-			return;
+			if(down)		{ StartDrop(kBackFlipOut, 170.0f, "pushed away from the wall"); return; }
+			if(g_cfg.entryMode == 0) { StartDrop(kDrop, 0.0f, "let go in place"); return; }		// modo simples: Salto sozinho larga
+			return;																				// modo original: Salto sozinho nao faz nada
 		}
 
 		float vz = 0.0f, vt = 0.0f, rate = 0.0f;
 		int motion = kHang;
-		if(up)			{ motion = kUp;		vz = g_cfg.climbSpeed;		rate = g_cfg.climbSpeed / kUpNatural; }
+		const bool wantRun = g_in.sprint && (up || left || right) && !down;
+		if(wantRun)
+		{
+			const float sp = g_cfg.wallRunSpeed, dg = g_cfg.wallRunDiag * 0.7071f;
+			if(up && left)			{ motion = kRunDiagLeft;	vz = sp * dg;	vt = -sp * dg; }
+			else if(up && right)	{ motion = kRunDiagRight;	vz = sp * dg;	vt = sp * dg; }
+			else if(up)				{ motion = kRunUp;			vz = sp; }
+			else if(left)			{ motion = kRunLeft;		vt = -sp; }
+			else					{ motion = kRunRight;		vt = sp; }
+			rate = sqrtf(vz * vz + vt * vt) / kRunNatural;
+		}
+		else if(up)		{ motion = kUp;		vz = g_cfg.climbSpeed;		rate = g_cfg.climbSpeed / kUpNatural; }
 		else if(down)	{ motion = kDown;	vz = -g_cfg.downSpeed;		rate = g_cfg.downSpeed / kUpNatural; }
 		else if(left)	{ motion = kLeft;	vt = -g_cfg.sideSpeed;		rate = g_cfg.sideSpeed / kSideNatural; }
 		else if(right)	{ motion = kRight;	vt = g_cfg.sideSpeed;		rate = g_cfg.sideSpeed / kSideNatural; }
+
+		// ao comecar ou acabar de correr, toca-se uma animacao de ponte (runLaunch / runCatch)
+		if(wantRun != g_wasRun)
+		{
+			g_wasRun = wantRun;
+			g_bridgeMotion = wantRun ? (up ? kRunLaunch : (left ? kRunLaunchLeft : kRunLaunchRight)) : kRunCatch;
+			g_bridgeSecs = FC_MotionSeconds(g_bridgeMotion);
+			g_bridgeStart = now;
+		}
 
 		if(motion != g_motion) { g_motion = motion; g_phase = 0.0f; }
 		if(rate > 0.0f)
@@ -476,6 +600,12 @@ namespace
 			if(secs > 0.0f) { g_phase += dt * rate / secs; while(g_phase >= 1.0f) g_phase -= 1.0f; }
 		}
 		else g_phase = 0.0f;
+
+		if(g_bridgeSecs > 0.0f && (float)(now - g_bridgeStart) / 1000.0f < g_bridgeSecs)
+		{
+			g_motion = g_bridgeMotion;
+			g_phase = (float)(now - g_bridgeStart) / 1000.0f / g_bridgeSecs;
+		}
 
 		// canto INTERIOR: ha outra parede mesmo ao lado, no sentido do movimento? Passa para ela (em vez de entrar nela).
 		if(vt != 0.0f)
@@ -537,6 +667,16 @@ namespace
 					_MESSAGE("gameplay: outer corner - wrapped around to the next face");
 					return;
 				}
+			}
+			if(vt != 0.0f && g_cfg.contextHops)
+			{
+				// ha outra parede ao alcance de um salto, do lado para onde andava? Salta sozinho para ela.
+				const float sign = vt > 0.0f ? 1.0f : -1.0f;
+				const float dx = g_pos[0] + (-g_n[1]) * sign * kCtxHopDist * g_cfg.hopScale;
+				const float dy = g_pos[1] + ( g_n[0]) * sign * kCtxHopDist * g_cfg.hopScale;
+				static const float chestC[1] = { 70.0f };
+				const WallHit dest = ProbeWall(player, -g_n[0], -g_n[1], dx, dy, g_pos[2], g_cfg.gap + 60.0f, chestC, 1);
+				if(dest.found) { StartHop(sign > 0.0f ? kCtxHopRight : kCtxHopLeft, sign * kCtxHopDist, 0.0f, true); return; }
 			}
 			if(up)
 			{
@@ -626,13 +766,16 @@ namespace
 
 		LoadConfig();															// afinacoes relidas: nao precisa de recompilar para afinar
 
+		// modo original: so entra com Salto + W + A + D premidos juntos (evita entrar sem querer)
+		if(g_cfg.entryMode != 0 && !(g_in.forward && g_in.left && g_in.right)) return false;
+
 		const NiPoint3 feet = Engine::Position(player);
 		if(!g_cfg.alwaysCling)
 		{
 			const char * why = "";
 			if(StartMantle(player, fx, fy, feet.x, feet.y, feet.z, &why)) return true;
 		}
-		return StartCling(player, ctrl, fx, fy);
+		return StartEntry(player, fx, fy, false);
 	}
 
 	void __fastcall Hook_JumpButton(void * handler, void *, ButtonEvent * event, void * data)
@@ -671,6 +814,7 @@ namespace
 				else if(*control == strings->back)			g_in.back = held;
 				else if(*control == strings->strafeLeft)	g_in.left = held;
 				else if(*control == strings->strafeRight)	g_in.right = held;
+				else if(*control == strings->sprint)		g_in.sprint = held;
 				else if(*control == strings->jump)			{ if(pressedNow) g_in.jumpEdge = 1; }
 				else if(*control == strings->sneak)			{ if(pressedNow) g_in.sneakEdge = 1; }
 			}
