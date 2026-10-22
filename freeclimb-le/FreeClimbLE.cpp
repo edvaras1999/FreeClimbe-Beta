@@ -21,7 +21,7 @@
 #include <shlobj.h>
 
 #define PLUGIN_NAME				"FreeClimbLE"
-#define PLUGIN_VERSION_STRING	"0.24.0 (passo 24: todas as funcoes ligadas: entrada original, apanhar no ar, corrida na parede, saltos contextuais, largar com animacao)"
+#define PLUGIN_VERSION_STRING	"0.24.1 (passo 24b: entrada por Salto sozinho como padrao)"
 #define PLUGIN_LOG_FILE			"\\My Games\\Skyrim\\SKSE\\FreeClimbLE.log"
 
 static PluginHandle				g_pluginHandle	= kPluginHandle_Invalid;

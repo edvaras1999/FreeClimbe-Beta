@@ -59,7 +59,7 @@ namespace
 		g_cfg.faceWall = 1;
 		g_cfg.hopScale = 1.8f;	g_cfg.hopSpeed = 1.1f;
 		g_cfg.attachReach = 65.0f;	g_cfg.hopEase = 1;	g_cfg.warp = 1;
-		g_cfg.entryMode = 1;	g_cfg.airReach = 90.0f;	g_cfg.wallRunSpeed = 379.5f;	g_cfg.wallRunDiag = 1.15f;
+		g_cfg.entryMode = 0;	g_cfg.airReach = 90.0f;	g_cfg.wallRunSpeed = 379.5f;	g_cfg.wallRunDiag = 1.15f;
 		g_cfg.contextHops = 1;	g_cfg.catchSpeed = 1.5f;
 	}
 
@@ -137,9 +137,9 @@ namespace
 			else if(KeyIs(key, "CatchSpeed"))	g_cfg.catchSpeed = f;
 		}
 
-		_MESSAGE("gameplay: settings: reach %.0f, wall gap %.0f, speeds up/down/side %.0f/%.0f/%.0f, ledge %.0f-%.0f, head %.0f, alwaysCling %d, faceWall %d, hop scale/speed %.2f/%.2f, attach reach %.0f, ease %d, warp %d",
+		_MESSAGE("gameplay: settings: reach %.0f, wall gap %.0f, speeds up/down/side %.0f/%.0f/%.0f, ledge %.0f-%.0f, head %.0f, alwaysCling %d, faceWall %d, hop scale/speed %.2f/%.2f, attach reach %.0f, ease %d, warp %d, ENTRY MODE %d (%s)",
 				 (double)g_cfg.reach, (double)g_cfg.gap, (double)g_cfg.climbSpeed, (double)g_cfg.downSpeed, (double)g_cfg.sideSpeed,
-				 (double)g_cfg.minLedge, (double)g_cfg.maxLedge, (double)g_cfg.headHeight, g_cfg.alwaysCling, g_cfg.faceWall, (double)g_cfg.hopScale, (double)g_cfg.hopSpeed, (double)g_cfg.attachReach, g_cfg.hopEase, g_cfg.warp);
+				 (double)g_cfg.minLedge, (double)g_cfg.maxLedge, (double)g_cfg.headHeight, g_cfg.alwaysCling, g_cfg.faceWall, (double)g_cfg.hopScale, (double)g_cfg.hopSpeed, (double)g_cfg.attachReach, g_cfg.hopEase, g_cfg.warp, g_cfg.entryMode, g_cfg.entryMode == 0 ? "Jump alone" : "Jump + W + A + D together");
 	}
 
 	// ------------------------------------------------------------------ estado
@@ -767,7 +767,17 @@ namespace
 		LoadConfig();															// afinacoes relidas: nao precisa de recompilar para afinar
 
 		// modo original: so entra com Salto + W + A + D premidos juntos (evita entrar sem querer)
-		if(g_cfg.entryMode != 0 && !(g_in.forward && g_in.left && g_in.right)) return false;
+		if(g_cfg.entryMode != 0 && !(g_in.forward && g_in.left && g_in.right))
+		{
+			static DWORD lastWarn = 0;
+			if(GetTickCount() - lastWarn > 4000)
+			{
+				lastWarn = GetTickCount();
+				_MESSAGE("gameplay: jump ignored - EntryMode=%d needs Jump + W + A + D held together (keys seen: W %d, A %d, D %d). Set EntryMode=0 in FreeClimbLE.ini to enter with Jump alone.",
+						 g_cfg.entryMode, (int)g_in.forward, (int)g_in.left, (int)g_in.right);
+			}
+			return false;
+		}
 
 		const NiPoint3 feet = Engine::Position(player);
 		if(!g_cfg.alwaysCling)

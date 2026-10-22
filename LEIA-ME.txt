@@ -1,12 +1,16 @@
-FREECLIMB LE - PASSO 24: TODAS AS FUNCOES LIGADAS (como o mod original)
+FREECLIMB LE - PASSO 24b: TODAS AS FUNCOES LIGADAS (entrada por SALTO SOZINHO por padrao)
+
+CORRECAO 24b: no 24 eu tinha posto como padrao a entrada do mod original (Salto+W+A+D juntos) e o Espaco
+sozinho deixou de funcionar. Agora o PADRAO e Salto sozinho, como antes. A entrada original fica
+opcional: EntryMode=1 no .ini. O log diz "ENTRY MODE" e avisa quando ignora um salto por esse motivo.
 
 CONTROLOS (usam as teclas do PROPRIO jogo: se mudou W/A/S/D/Shift/Espaco/Ctrl no jogo, seguem essas)
  ENTRAR NA PAREDE
-   Salto + W + A + D (premidos JUNTOS)   junto a uma parede  -> apanha a parede
+   Salto (sozinho, padrao)  ou  Salto + W + A + D juntos (EntryMode=1)  junto a uma parede  -> apanha a parede
         a pe:  "reach" (se ja esta colado a parede) ou "jumpCatch"
    O mesmo A MEIO DE UM SALTO perto de uma parede:  "jumpCatch" / "ledgeCatch" (se ha borda) /
         "sprintCatch" (se estava a correr com Shift)
-   (Se preferir entrar so com Salto: EntryMode=0 no .ini)
+   (EntryMode=0 no .ini = Salto sozinho; EntryMode=1 = Salto+W+A+D juntos, como o mod original.)
  NA PAREDE
    W / S / A / D           sobe / desce / anda de lado
    Shift + direcao         CORRE na parede (runUp, runLeft, runRight, diagonais), com as animacoes de
@@ -38,8 +42,8 @@ COMO FAZER (igual aos passos anteriores)
  FreeClimbLE.dll; copie o FreeClimbLE.ini. Carregue o save e espere ~1 minuto.
 
 TESTES (por ordem; diga-me o que falha, de forma simples)
- a) Entrar: Salto+W+A+D junto a uma parede, a pe. Apanha? Se for dificil de premir, EntryMode=0.
- b) Entrar no ar: salte para uma parede, carregue Salto+W+A+D no ar. Apanha? Com Shift (sprintCatch)?
+ a) Entrar: Espaco junto a uma parede, a pe. Apanha? (reach/jumpCatch)
+ b) Entrar no ar: salte para uma parede e carregue Espaco outra vez no ar. Apanha? Com Shift (sprintCatch)?
  c) Correr na parede: segure Shift + W, + A, + D, + W+A, + W+D. Anda a boa velocidade? Animacao certa?
  d) Largar: S+Salto (cambalhota para tras), A+S+D+Salto (no sitio), Agachar.
  e) Saltos contextuais: ande de lado ate ao fim de uma parede com outra ao alcance (dois pilares).
