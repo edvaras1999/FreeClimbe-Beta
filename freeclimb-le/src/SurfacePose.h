@@ -1,19 +1,26 @@
 #pragma once
 
 class SurfacePose {
-    struct Contact {Vec point{};float weight{};bool valid{},retiring{};};
+    struct ContactPose {Vec nominal{},start{},pole{},normal{};Quat upper{},middle{};float scale{};};
+    struct Contact {Vec point{},rejectedPoint{};ContactPose rejectedPose{};float weight{};bool valid{},retiring{},rejected{};};
     std::array<Contact,4> contacts{};
-    Pose previous,penultimate,transitionFrom;
+    Pose previous,penultimate,transitionFrom,previousAuthored;
     PoseContinuation continuation;
+    ClimbGripPose gripPose;
+    std::array<bool,2> transitionArmGuard{};
     float previousDt{};
     Motion lastMotion=Motion::none;
+    Motion lastWallRunDirection=Motion::none,runSequenceDirection=Motion::none;
+    bool lastContextRecovery{},lastSupportRecovery{};
+    Vec lastRecoveryStart{},lastRecoveryTarget{};
     float phase{},lastSamplePhase{},transition=1,transitionSeconds=.18f;
     Motion bridge=Motion::none;
+    Motion bridgeDirection=Motion::none;
     Motion stopSource=Motion::none;
     float stopPhase{};
     Quat runOrientation,actionOrientation;
     Vec actionHeading{};
-    float sideGrip{},surfaceOffset{};
+    float sideGrip{},surfaceOffset{},surfaceMissSeconds{};
     Vec lastPosition{},lastNormal{};
     std::array<Vec,2> topInitialPalms{};
     std::array<Vec,2> topReplant{};
@@ -25,9 +32,10 @@ class SurfacePose {
     float entryElapsed{};
     float obstacleAlong{};
     bool started{};
+    bool sourceReturn{};
     bool lastWallTargets{};
     static bool wallRun(Motion m) {return m>=Motion::runLeft&&m<=Motion::runDiagonalRight;}
-    static bool catchEntry(Motion m) {return m==Motion::reach||m==Motion::jumpCatch||m==Motion::sprintCatch||m==Motion::ledgeCatch||m==Motion::runLaunch;}
+    static bool catchEntry(Motion m) {return m==Motion::reach||m==Motion::jumpCatch||m==Motion::ledgeCatch||m==Motion::runLaunch;}
     static bool launch(Motion m) {return m==Motion::runLaunch||m==Motion::runLaunchLeft||m==Motion::runLaunchRight;}
     static bool climbCycle(Motion m) {return m>=Motion::up&&m<=Motion::right;}
 
@@ -41,7 +49,7 @@ public:
     int runFootContacts{};
     float measuredSurfaceGap{},appliedSurfaceGap{};
     unsigned surfaceSamples{};
-    bool surfaceGapValid{};
+    bool surfaceGapValid{},surfaceHeld{};
     std::array<float,2> surfacePalmGaps{};
 
     float movementScale() const {return 1.f;}
@@ -49,12 +57,28 @@ public:
     float sampledPhase() const {return lastSamplePhase;}
     float blendProgress() const {return transition;}
     Motion bridgeMotion() const {return bridge;}
+    Motion bridgeWallRunDirection() const {return bridgeDirection;}
+    unsigned rejectedIdleContacts() const {return unsigned(std::count_if(contacts.begin(),contacts.end(),[](const auto& value){return value.rejected;}));}
+    float surfaceHoldSeconds() const {return surfaceHeld?surfaceMissSeconds:0.f;}
     void reset() {*this={};}
     Pose update(const Library& lib,World& world,const Traversal& traversal,Motion motion,float dt,float scale) {
         dt=std::clamp(dt,0.f,.05f);scale=std::clamp(scale,.5f,2.f);
         if(started&&dt<=1e-6f)return previous;
         if(!isActiveMotion(motion))motion=Motion::hang;
-        const auto& clip=lib.clip(motion);
+        const auto wallRunDirection=traversal.poseDirection(motion);
+        const bool contextRecovery=motion==Motion::contextHang&&traversal.holdsDestinationEdge(motion);
+        const bool contextSequence=motion==Motion::contextHang&&lib.hasContextHopSequence(wallRunDirection);
+        const bool supportRecovery=traversal.recoveringSupport();
+        const bool recoveryChanged=supportRecovery!=lastSupportRecovery||(supportRecovery&&
+            ((traversal.edgeStart()-lastRecoveryStart).length()>.001f||(traversal.edgeTarget()-lastRecoveryTarget).length()>.001f));
+        const bool motionChanged=motion!=lastMotion||wallRunDirection!=lastWallRunDirection||contextRecovery!=lastContextRecovery||recoveryChanged;
+        if(runMotion(wallRunDirection))runSequenceDirection=wallRunDirection;
+        const auto& clip=lib.clip(motion,wallRunDirection,contextRecovery);
+        const bool authoredPlayback=clip.authoredPlayback;
+        const bool sourceTransition=authoredPlayback||(started&&lib.clip(lastMotion,lastWallRunDirection,lastContextRecovery).authoredPlayback);
+        if(authoredPlayback)sourceReturn=false;
+        else if(started&&lib.clip(lastMotion,lastWallRunDirection,lastContextRecovery).authoredPlayback)sourceReturn=true;
+        auto solveIK=[&](Pose& value,int a,int b,int c,Vec target,Vec pole){return lib.ik(value,a,b,c,target,pole,!authoredPlayback);};
         const Vec pos=traversal.position,n=traversal.normal;
         const Vec right{-n.y,n.x,0},forward=n*-1;
         auto toWorld=[&](Vec v){return pos+(right*v.x+forward*v.y+Vec{0,0,v.z})*scale;};
@@ -66,7 +90,7 @@ public:
             }
             value[4].t=value[4].t+delta;
         };
-        const bool running=runMotion(motion),flipping=flipMotion(motion);
+        const bool running=runMotion(motion);
         const bool runEntry=motion==Motion::runLaunch;
         const bool entryReturn=started&&lastMotion==Motion::runLaunch&&motion==entryReturnMotion;
         if(runEntry&&(!started||motion!=lastMotion)){entryElapsed=0;entryReturnMotion=Motion::none;}
@@ -78,19 +102,21 @@ public:
             if(obstacleKick)obstacleAlong=traversal.actionRouteDistance();
             if(!obstacleKick&&!obstacleReturn)obstacleReturnMotion=Motion::none;
         }
-        const bool parkour=kick||flipping;
+        const bool parkour=kick;
         const bool backKick=motion==Motion::dropBack;
         const bool backFlip=motion==Motion::backFlipOut;
         const bool departing=backKick||backFlip;
-        const bool edgeAction=traversal.usesEdgeTargets(motion);
-        const bool wallTargets=traversal.usesWallTargets(motion);
+        const bool edgeAction=!authoredPlayback&&traversal.usesEdgeTargets(motion);
+        const bool wallTargets=!authoredPlayback&&traversal.usesWallTargets(motion);
         const bool newHang=motion==Motion::contextHang,newHop=threepeatHop(motion),newMantle=motion==Motion::contextMantle;
         const float wallPalmOffset=newHang||newHop?capturedWallPalmOffset:6.f;
         const bool loop=(motion>=Motion::hang&&motion<=Motion::right)||newHang||running;
         const bool mantle=newMantle;
         const bool entry=catchEntry(motion);
         const bool supportedPlacement=loop&&!edgeAction&&(traversal.state==State::wall||traversal.state==State::ledge);
-        surfaceSamples=0;surfaceGapValid=false;surfacePalmGaps={};measuredSurfaceGap=traversal.cfg.gap;
+        const bool stationaryIdle=started&&motion==Motion::hang&&!authoredPlayback&&motion==lastMotion&&supportedPlacement&&
+            (pos-lastPosition).length()<=.025f*scale&&(n-lastNormal).length()<.001f;
+        surfaceSamples=0;surfaceGapValid=false;surfaceHeld=false;surfacePalmGaps={};measuredSurfaceGap=traversal.cfg.gap;
         Vec measuredPoint{},measuredNormal{};
         float surfaceGoal=0;
         if(supportedPlacement) {
@@ -122,10 +148,15 @@ public:
                 if(measured)break;
             }
             if(measured) {
+                surfaceMissSeconds=0;
                 measuredSurfaceGap=*measured;surfaceGapValid=true;
                 surfaceGoal=std::abs(*measured-traversal.cfg.gap)<.1f?0.f:
                     std::clamp(*measured-traversal.cfg.gap,0.f,20.f);
             }
+        }
+        if(!surfaceGapValid) {
+            surfaceMissSeconds=std::min(.2f,surfaceMissSeconds+dt);
+            if(stationaryIdle&&surfaceMissSeconds<=.1f&&surfaceOffset>0) {surfaceGoal=surfaceOffset;surfaceHeld=true;}
         }
         surfaceOffset=started?surfaceOffset+std::clamp(surfaceGoal-surfaceOffset,-90.f*dt,90.f*dt):surfaceGoal;
         const float poseGap=traversal.cfg.gap+surfaceOffset;
@@ -170,13 +201,13 @@ public:
             placeOriented(pose,runOrientation,traversal.direction());
             if(sidewaysRun) {
                 auto frame=sideRunFrame(traversal.surfaceNormal.z,traversal.direction());frame.rotation=runOrientation;
-                applySideRunBrace(lib,pose,frame,gait);
+                applySideRunBrace(lib,pose,frame,gait,1.f,wallRunDirection);
             }
         };
 
-        const bool stopTargetChanged=stopSource!=Motion::none&&(motion!=Motion::hang||edgeAction||traversal.preparingEdge());
+        const bool stopTargetChanged=stopSource!=Motion::none&&(authoredPlayback||motion!=Motion::hang||edgeAction||traversal.preparingEdge());
         if(stopTargetChanged)stopSource=Motion::none;
-        if(started&&motion==Motion::hang&&motion!=lastMotion&&climbCycle(lastMotion)&&!edgeAction&&!traversal.preparingEdge()) {
+        if(!sourceTransition&&started&&motion==Motion::hang&&motion!=lastMotion&&climbCycle(lastMotion)&&!edgeAction&&!traversal.preparingEdge()) {
             const auto before=lib.world(previous);
             auto cost=[&](const Pose& sample) {
                 const auto body=lib.world(sample);float value=0;
@@ -223,7 +254,7 @@ public:
 
                     const int upper=hand?31:28,elbow=hand?32:29,wrist=hand?39:38;
                     const Vec goal=body[wrist].t+Vec{correction.dot(right),correction.dot(forward),correction.z}/scale;
-                    auto candidate=value;lib.ik(candidate,upper,elbow,wrist,goal,body[elbow].t);
+                    auto candidate=value;solveIK(candidate,upper,elbow,wrist,goal,body[elbow].t);
                     const auto checked=lib.world(candidate);
                     const float bend=std::acos(std::clamp((checked[elbow].t-checked[upper].t).unit().dot((checked[wrist].t-checked[elbow].t).unit()),-1.f,1.f));
                     if(bend<.17453293f){supported=false;break;}
@@ -231,28 +262,34 @@ public:
                 if(supported){stopSource=lastMotion;stopPhase=choices[attempt].phase;break;}
             }
         }
-        if(started&&(motion!=lastMotion||wallTargets!=lastWallTargets||stopTargetChanged)) {
+        if(started&&(motionChanged||wallTargets!=lastWallTargets||stopTargetChanged)) {
 
-            const bool continueBridge=!edgeAction&&!stopTargetChanged&&bridge!=Motion::none&&transition<1&&wallTargets==lastWallTargets&&
+            const bool continueBridge=!sourceTransition&&!edgeAction&&!stopTargetChanged&&!recoveryChanged&&bridge!=Motion::none&&transition<1&&wallTargets==lastWallTargets&&
                 ((running&&runMotion(lastMotion))||(!running&&!runMotion(lastMotion)&&
                     (climbCycle(motion)||motion==Motion::hang)&&(climbCycle(lastMotion)||lastMotion==Motion::hang)));
             if(!continueBridge) {
                 transitionFrom=previous;transition=0;sideGrip=0;for(auto& c:contacts)c={};
                 continuation.begin(previous,penultimate,previousDt);
-                bridge=Motion::none;
+                for(int hand=0;hand<2;++hand)transitionArmGuard[hand]=lib.armBendValid(previous,hand);
+                bridge=Motion::none;bridgeDirection=Motion::none;
             }
             if(!continueBridge) {
-            if(running&&!runMotion(lastMotion)&&!hopMotion(lastMotion)&&!catchEntry(lastMotion))
+            if(!sourceTransition&&running&&!runMotion(lastMotion)&&!hopMotion(lastMotion)&&!catchEntry(lastMotion))
                 bridge=wallRun(motion)?(traversal.direction().x<0?Motion::runLaunchLeft:Motion::runLaunchRight):Motion::runLaunch;
-            else if(!running&&runMotion(lastMotion)&&!mantle&&!hopMotion(motion)&&!departing&&motion!=Motion::drop)bridge=Motion::runCatch;
-            if(newMantle&&traversal.topPreparation()<1.f&&(runMotion(lastMotion)||launch(lastMotion)||
+            else if(!sourceTransition&&!running&&runMotion(lastMotion)&&!mantle&&!hopMotion(motion)&&!departing&&motion!=Motion::drop)bridge=Motion::runCatch;
+            if(!sourceTransition&&newMantle&&traversal.topPreparation()<1.f&&(runMotion(lastMotion)||launch(lastMotion)||
                 (lastMotion>=Motion::kickUp&&lastMotion<=Motion::kickRight)||traversal.obstacleJumpActive()))bridge=Motion::runCatch;
+            if(bridge!=Motion::none) {
+                bridgeDirection=launch(bridge)?motion:runMotion(lastMotion)?lastMotion:runSequenceDirection;
+                if(lib.clip(bridge,bridgeDirection).authoredPlayback){bridge=Motion::none;bridgeDirection=Motion::none;}
+            }
             transitionSeconds=(newMantle&&traversal.topPreparation()<1.f)?.24f:(newHang&&traversal.holdsPreparedEdge(motion))?.06f:(newHop&&lastMotion==Motion::contextHang)?.06f:(newHang&&threepeatHop(lastMotion))?.18f:
                 parkour?.07f:backFlip?.10f:backKick?.09f:launch(bridge)?.22f:bridge==Motion::runCatch?.20f:
                 obstacleReturn||entryReturn?.08f:running?(hopMotion(lastMotion)?.12f:.20f):hopMotion(lastMotion)?.14f:.18f;
+            if(sourceTransition)transitionSeconds=std::clamp(clip.seconds*.12f,.01f,.22f);
             }
-            if(newHang&&motion!=lastMotion)phase=0.f;
-            if(loop&&!obstacleReturn&&!entryReturn&&motion!=Motion::hang&&!newHang) {
+            if((newHang||authoredPlayback)&&motionChanged)phase=0.f;
+            if(!authoredPlayback&&loop&&!obstacleReturn&&!entryReturn&&motion!=Motion::hang&&!newHang) {
 
                 float best=1e9f;const auto from=lib.world(previous);
                 for(int frame=0;frame<48;++frame) {
@@ -278,7 +315,7 @@ public:
                 topInitialPalms[hand]=started?lastPosition+(oldRight*point.x-lastNormal*point.y+Vec{0,0,point.z})*scale:toWorld(point);
             }
         }
-        const bool replanted=newMantle&&traversal.topReplanted(traversal.topSamplePhase(traversal.progress()));
+        const bool replanted=!authoredPlayback&&newMantle&&traversal.topReplanted(traversal.topSamplePhase(traversal.progress()));
         if(replanted&&!topReplantProbed) {
             topReplantProbed=true;
             for(int hand=0;hand<2;++hand) {
@@ -300,12 +337,16 @@ public:
             const auto target=traversal.topHand(hand)+traversal.topHandNormal(hand)*(.8f*scale);
             return topInitialPalms[hand]+(target-topInitialPalms[hand])*smooth(topPrepared?traversal.topPreparation()/.40f:traversal.progress()/.20f);
         };
-        if(loop&&clip.stride>1&&started)phase=std::fmod(phase+std::min((pos-lastPosition).length()/(clip.stride*scale),dt*2.8f/std::max(.1f,clip.seconds)),1.f);
-        else if(loop)phase=std::fmod(phase+dt/std::max(.1f,clip.seconds),1.f);
-        float samplePhase=loop?phase:mantle?traversal.progress():entry?traversal.reachProgress():traversal.actionProgress();
+        if(authoredPlayback&&loop&&(climbCycle(motion)||running)) {
+            if(started&&motion==lastMotion&&clip.stride>1)phase=std::fmod(phase+(pos-lastPosition).length()/(clip.stride*scale),1.f);
+        } else if(loop&&clip.stride>1&&started&&!(authoredPlayback&&(motion==Motion::hang||newHang)))phase=std::fmod(phase+std::min((pos-lastPosition).length()/(clip.stride*scale),dt*2.8f/std::max(.1f,clip.seconds)),1.f);
+        else if(loop)phase=std::fmod(phase+dt/std::max(authoredPlayback?.001f:.1f,clip.seconds),1.f);
+        float samplePhase=loop?phase:authoredPlayback?traversal.authoredPhase(motion):mantle?traversal.progress():
+            entry?traversal.reachProgress():traversal.actionProgress();
         if(newMantle)samplePhase=traversal.topSamplePhase(samplePhase);
+        if(contextSequence)samplePhase=traversal.contextHangPhase();
         if(stopSource!=Motion::none)samplePhase=stopPhase;
-        if(motion==Motion::reach)samplePhase=.55f+.45f*samplePhase;
+        if(!authoredPlayback&&motion==Motion::reach)samplePhase=.55f+.45f*samplePhase;
         lastSamplePhase=samplePhase;
         auto edgeWeights=[&](int hand) {
             if(traversal.holdsDestinationEdge(motion))return std::array<float,2>{0,1};
@@ -321,6 +362,7 @@ public:
             return traversal.edgeHand(hand,destination)+traversal.edgeContactNormal(hand,destination)*((wallTargets?wallPalmOffset:.8f)*scale);
         };
         auto topWeight=[&](int hand) {
+            if(authoredPlayback)return 0.f;
             return newMantle&&(!replanted||topReplantValid[hand])?traversal.topHandWeight(hand,samplePhase):0.f;
         };
         auto topSupport=[&](const Pose& body) {
@@ -332,9 +374,11 @@ public:
             return total>0?(target-palms)/total:Vec{};
         };
 
-        const float flightPhase=actionFlightPhase(samplePhase);
-        Pose p=lib.sample(stopSource!=Motion::none?stopSource:motion,flipping?flightPhase:kick?std::clamp(samplePhase/.60f,0.f,1.f):samplePhase);
-        if(mantle) {
+        Pose p=lib.sample(stopSource!=Motion::none?stopSource:motion,authoredPlayback?samplePhase:kick?std::clamp(samplePhase/.60f,0.f,1.f):samplePhase,wallRunDirection,contextRecovery);
+        if(authoredPlayback) {
+            p[0].t=p[0].t-traversal.authoredRoot(motion,samplePhase);
+            if(!mantle&&!departing&&motion!=Motion::drop)placeWall(p,false);
+        } else if(mantle) {
             if(traversal.crestTop()) {
                 const float lean=std::asin(std::clamp(traversal.surfaceNormal.z,0.f,.7f))*(1-smooth((samplePhase-.56f)/.30f));
                 const auto before=lib.world(p);const Vec pivot=(lib.palm(before,0)+lib.palm(before,1))*.5f;
@@ -362,11 +406,13 @@ public:
         } else if(runEntry) {
 
             entryElapsed+=dt;
-            const float groundPhase=std::fmod(entryElapsed/std::max(.1f,lib.clip(Motion::runUp).seconds),1.f);
-            auto incoming=lib.sample(Motion::runUp,groundPhase);
+            if(!lib.reference(motion,PlaybackReference::launchApproach).authoredPlayback) {
+            const float groundPhase=std::fmod(entryElapsed/std::max(.1f,lib.reference(motion,PlaybackReference::launchApproach).seconds),1.f);
+            auto incoming=lib.sampleReference(motion,PlaybackReference::launchApproach,groundPhase);
             placeWall(p,true);
             const float planted=smooth(samplePhase/.24f);
             for(std::size_t i=0;i<p.size();++i)p[i]=blend(incoming[i],p[i],planted);
+            } else placeWall(p,true);
             if(samplePhase>=.16f) {
                 const Vec direction=traversal.direction();
                 const bool moving=std::abs(direction.x)+std::abs(direction.y)>.1f;
@@ -377,11 +423,12 @@ public:
                         (direction.x<0?Motion::runDiagonalLeft:Motion::runDiagonalRight)):
                     (std::abs(direction.y)>std::abs(direction.x)?(direction.y<0?Motion::down:Motion::up):
                         (direction.x<0?Motion::left:Motion::right));
+                if(!lib.clip(target).authoredPlayback) {
                 auto placeDestination=[&](Pose& value,float gait) {
                     if(resumeRun) {
                         const auto orientation=std::abs(direction.x)>.1f?sideRunFrame(traversal.surfaceNormal.z,direction).rotation:wallRotation(direction);
                         placeOriented(value,orientation,direction);
-                        if(std::abs(direction.x)>.1f){applySideRunBrace(lib,value,sideRunFrame(traversal.surfaceNormal.z,direction),gait);limitSideRunUpperRoll(lib,value,direction.x>0?0:1);}
+                        if(std::abs(direction.x)>.1f){applySideRunBrace(lib,value,sideRunFrame(traversal.surfaceNormal.z,direction),gait,1.f,target);limitSideRunUpperRoll(lib,value,direction.x>0?0:1);}
                     } else placeWall(value,false);
                 };
                 if(entryReturnMotion!=target) {
@@ -411,39 +458,44 @@ public:
                 auto destination=lib.sample(target,phase);placeDestination(destination,phase);
                 const float settle=smooth((samplePhase-.20f)/.70f);
                 for(std::size_t i=0;i<p.size();++i)p[i]=blend(p[i],destination[i],settle);
+                }
             }
         } else if(running) {
             placeRun(p,phase);
         } else if(parkour) {
-            if(flipping||motion==Motion::kickUp)placeOriented(p,actionOrientation,actionHeading);
+            if(motion==Motion::kickUp)placeOriented(p,actionOrientation,actionHeading);
             else placeWall(p,true);
-            if(!obstacleKick&&(flipping||motion!=Motion::kickUp)) {
-                auto push=lib.sample(Motion::kickUp,actionPushPhase(samplePhase));
+            if(!obstacleKick&&motion!=Motion::kickUp&&!lib.reference(motion,PlaybackReference::kickTakeoff).authoredPlayback) {
+                auto push=lib.sampleReference(motion,PlaybackReference::kickTakeoff,actionPushPhase(samplePhase));
                 placeOriented(push,actionOrientation,actionHeading);
                 const float flight=smooth((samplePhase-.12f)/.14f);
                 for(std::size_t i=0;i<p.size();++i)p[i]=blend(push[i],p[i],flight);
             }
-            const float returnAt=obstacleKick?.48f:flipping?.80f:.60f;
+            const float returnAt=obstacleKick?.48f:.60f;
             if(samplePhase>returnAt) {
-                const float returnPhase=obstacleKick?std::clamp((samplePhase-returnAt)/(1-returnAt),0.f,1.f):actionReturnPhase(motion,samplePhase);
+                const auto direction=traversal.direction();
+                const bool resumeRun=traversal.wallRunning();
+                const bool moving=std::abs(direction.x)+std::abs(direction.y)>.1f;
+                const Motion returnMotion=obstacleKick?(!moving?Motion::hang:resumeRun?
+                    (std::abs(direction.x)<.1f?Motion::runUp:std::abs(direction.y)<.1f?
+                        (direction.x<0?Motion::runLeft:Motion::runRight):
+                        (direction.x<0?Motion::runDiagonalLeft:Motion::runDiagonalRight)):
+                    (std::abs(direction.y)>std::abs(direction.x)?(direction.y<0?Motion::down:Motion::up):
+                        (direction.x<0?Motion::left:Motion::right))):resumeRun?Motion::runUp:
+                    motion==Motion::kickLeft?Motion::hopLeft:
+                    motion==Motion::kickRight?Motion::hopRight:Motion::hopUp;
+                if(!(obstacleKick?lib.clip(returnMotion):lib.reference(motion,resumeRun?PlaybackReference::kickRunLanding:PlaybackReference::kickLanding)).authoredPlayback) {
+                const float returnPhase=obstacleKick?std::clamp((samplePhase-returnAt)/(1-returnAt),0.f,1.f):actionReturnPhase(samplePhase);
                 Pose destination;
                 if(obstacleKick) {
 
-                    const auto direction=traversal.direction();
-                    const bool resumeRun=traversal.wallRunning();
-                    const bool moving=std::abs(direction.x)+std::abs(direction.y)>.1f;
-                    const Motion target=!moving?Motion::hang:resumeRun?
-                        (std::abs(direction.x)<.1f?Motion::runUp:std::abs(direction.y)<.1f?
-                            (direction.x<0?Motion::runLeft:Motion::runRight):
-                            (direction.x<0?Motion::runDiagonalLeft:Motion::runDiagonalRight)):
-                        (std::abs(direction.y)>std::abs(direction.x)?(direction.y<0?Motion::down:Motion::up):
-                            (direction.x<0?Motion::left:Motion::right));
+                    const Motion target=returnMotion;
                     auto placeDestination=[&](Pose& value,float gait) {
                         if(resumeRun&&moving) {
                             const auto orientation=std::abs(direction.x)>.1f?sideRunFrame(traversal.surfaceNormal.z,direction).rotation:wallRotation(direction);
                             placeOriented(value,orientation,direction);
                             if(std::abs(direction.x)>.1f) {
-                                applySideRunBrace(lib,value,sideRunFrame(traversal.surfaceNormal.z,direction),gait);
+                                applySideRunBrace(lib,value,sideRunFrame(traversal.surfaceNormal.z,direction),gait,1.f,target);
                                 limitSideRunUpperRoll(lib,value,direction.x>0?0:1);
                             }
                         } else placeWall(value,false);
@@ -469,18 +521,20 @@ public:
                     destination=lib.sample(target,phase);placeDestination(destination,phase);
                 } else if(traversal.wallRunning()) {
 
-                    destination=lib.sample(Motion::runUp,std::fmod(phase+returnPhase*.30f,1.f));
-                    const auto direction=traversal.direction();
+                    destination=lib.sampleReference(motion,PlaybackReference::kickRunLanding,std::fmod(phase+returnPhase*.30f,1.f));
                     const auto orientation=std::abs(direction.x)>.1f?sideRunFrame(traversal.surfaceNormal.z,direction).rotation:wallRotation(direction);
                     placeOriented(destination,orientation,direction);
-                    if(std::abs(direction.x)>.1f)applySideRunBrace(lib,destination,
-                        sideRunFrame(traversal.surfaceNormal.z,direction),std::fmod(phase+returnPhase*.30f,1.f));
+                    if(std::abs(direction.x)>.1f) {
+                        const float gait=std::fmod(phase+returnPhase*.30f,1.f);
+                        const auto reference=lib.reference(motion,PlaybackReference::kickRunBrace).authoredPlayback?destination:
+                            lib.sampleReference(motion,PlaybackReference::kickRunBrace,.5f+.10f*std::sin(gait*6.283185307f));
+                        applySideRunBrace(lib,destination,sideRunFrame(traversal.surfaceNormal.z,direction),gait,1.f,Motion::none,&reference);
+                    }
                 } else {
-                    const auto caught=motion==Motion::kickLeft||motion==Motion::flipLeft?Motion::hopLeft:
-                        motion==Motion::kickRight||motion==Motion::flipRight?Motion::hopRight:Motion::hopUp;
-                    destination=lib.sample(caught,.65f+.35f*returnPhase);placeWall(destination,false);
+                    destination=lib.sampleReference(motion,PlaybackReference::kickLanding,.65f+.35f*returnPhase);placeWall(destination,false);
                 }
                 for(std::size_t i=0;i<p.size();++i)p[i]=blend(p[i],destination[i],smooth(returnPhase));
+                }
             }
         } else if(backFlip) {
             placeBackFlipOut(lib,p,traversal.surfaceNormal.z,traversal.cfg.gap,scale);
@@ -488,11 +542,13 @@ public:
             placeWall(p,true);
         } else if(newHang||newHop) {
 
-            p[4].t.y+=traversal.cfg.gap/scale+(wallTargets?-capturedWallPalmOffset:gripEdgeDetail::palmInset)-traversal.cfg.threepeatHangForward;
+            p[4].t.y+=traversal.cfg.gap/scale+(wallTargets?-capturedWallPalmOffset:gripEdgeDetail::palmInset)-traversal.contextHangForward();
         } else {
 
             const float slope=std::clamp(traversal.surfaceNormal.z,0.f,.68f)*(entry?smooth(samplePhase):1.f);
-            p[0].q=Quat::axis({1,0,0},-std::asin(slope));
+            const auto tilt=Quat::axis({1,0,0},-std::asin(slope));
+            p[0].q=authoredPlayback?(tilt*p[0].q).unit():tilt;
+            if(authoredPlayback)p[0].t=tilt.rotate(p[0].t);
 
             p[4].t.y+=(poseGap*std::sqrt(1-slope*slope)-6*slope)/scale-38;
         }
@@ -514,9 +570,11 @@ public:
         transition=std::min(1.f,transition+dt/transitionSeconds);
         if(transitionFrom.size()==p.size()&&transition<1) {
             auto outgoing=continuation.sample(transition*transitionSeconds);
-            lib.guardArmBends(outgoing);
+            if(sourceTransition) {
+                for(int hand=0;hand<2;++hand)if(transitionArmGuard[hand])lib.guardArmBend(outgoing,hand);
+            } else lib.guardArmBends(outgoing);
             if(bridge!=Motion::none) {
-                auto transfer=lib.sample(bridge,transition);
+                auto transfer=lib.sample(bridge,transition,bridgeDirection);
 
                 placeWall(transfer,launch(bridge));
                 for(std::size_t i=0;i<p.size();++i) {
@@ -525,9 +583,9 @@ public:
                 }
             } else for(std::size_t i=0;i<p.size();++i)p[i]=blend(outgoing[i],p[i],smooth(transition));
         }
-        lib.guardArmBends(p);
+        if(!authoredPlayback)lib.guardArmBends(p);
         sidePalmContact=false;sidePalmError=0;runFootContacts=0;
-        if(sidewaysRun) {
+        if(!authoredPlayback&&sidewaysRun) {
             auto frame=sideRunFrame(traversal.surfaceNormal.z,traversal.direction());
             const Vec probe=toWorld(sideRunPalmProbe(lib,p,frame));
             const auto hit=world.ray(probe+n*32*scale,probe-n*64*scale);
@@ -548,7 +606,7 @@ public:
             for(int hand=0;hand<2&&clearance>0;++hand) {
                 const int upper=hand?31:28,elbow=hand?32:29,wrist=hand?39:38;
                 const auto body=lib.world(p);const auto local=p[wrist].q,orientation=body[wrist].q;
-                lib.ik(p,upper,elbow,wrist,body[wrist].t+Vec{0,-clearance,0},body[elbow].t);
+                solveIK(p,upper,elbow,wrist,body[wrist].t+Vec{0,-clearance,0},body[elbow].t);
                 lib.contactOrientation(p,wrist,local,orientation);
             }
         }
@@ -560,27 +618,41 @@ public:
                 if(clearance<=0)continue;
                 const int upper=hand?31:28,elbow=hand?32:29,wrist=hand?39:38;
                 const auto body=lib.world(p);const auto local=p[wrist].q,orientation=body[wrist].q;
-                lib.ik(p,upper,elbow,wrist,body[wrist].t+Vec{0,-clearance,wallTargets?0.f:clearance*(2.f/3.f)},body[elbow].t);
+                solveIK(p,upper,elbow,wrist,body[wrist].t+Vec{0,-clearance,wallTargets?0.f:clearance*(2.f/3.f)},body[elbow].t);
                 lib.contactOrientation(p,wrist,local,orientation);
             }
         }
-        lib.guardArmBends(p);
+        if(!authoredPlayback)lib.guardArmBends(p);
 
         auto limitSideArm=[&](Pose& candidate) {
-            return sidewaysRun&&limitSideRunUpperRoll(lib,candidate,
+            return !authoredPlayback&&sidewaysRun&&limitSideRunUpperRoll(lib,candidate,
                 traversal.direction().x>0?0:1,smooth(transition));
         };
         if(limitSideArm(p))sidePalmContact=false;
         const Pose authored=p;
-        auto weights=lib.contactWeights(stopSource!=Motion::none?stopSource:motion,samplePhase);
-        if(parkour||departing||runEntry)weights={0,0,0,0};
-        if(running)weights[0]=weights[1]=0;
+        auto weights=lib.contactWeights(stopSource!=Motion::none?stopSource:motion,samplePhase,wallRunDirection,contextRecovery);
+        if(!authoredPlayback&&(parkour||departing||runEntry))weights={0,0,0,0};
+        if(!authoredPlayback&&running)weights[0]=weights[1]=0;
         constexpr int starts[]={28,31,6,9},mids[]={29,32,7,10},ends[]={38,39,8,11};
+        std::array<ContactPose,4> contactPoses{};
+        auto sameContactPose=[&](const ContactPose& a,const ContactPose& b) {
+            const float distance=.25f*scale;
+            return (a.nominal-b.nominal).length()<distance&&(a.start-b.start).length()<distance&&
+                (a.pole-b.pole).length()<distance&&(a.normal-b.normal).length()<.001f&&std::abs(a.scale-b.scale)<.001f&&
+                angleBetween(a.upper,b.upper)<.01f&&angleBetween(a.middle,b.middle)<.01f;
+        };
+        auto rejectIdleContact=[&](int index) {
+            if(!stationaryIdle)return;
+            auto& contact=contacts[index];contact.rejected=true;
+            contact.rejectedPoint=contact.point;contact.rejectedPose=contactPoses[index];
+        };
         maxReachError=0;contactCount=sidePalmContact?1:0;
         for(int i=0;i<4;++i) {
             auto w=lib.world(p);auto& c=contacts[i];
             const Vec nominal=toWorld(w[ends[i]].t);
-            if(running&&i>=2) {
+            contactPoses[i]={nominal,toWorld(w[starts[i]].t),toWorld(w[mids[i]].t),traversal.surfaceNormal,p[starts[i]].q,p[mids[i]].q,scale};
+            if(!stationaryIdle||weights[i]<.01f||!sameContactPose(c.rejectedPose,contactPoses[i]))c.rejected=false;
+            if(!authoredPlayback&&running&&i>=2) {
 
                 auto& footContact=contacts[i];footContact={};
                 if(sidewaysRun) {
@@ -593,7 +665,7 @@ public:
                             if(delta.length()<28*scale) {
                                 const auto ankleOrientation=w[ends[i]].q;
                                 const auto target=w[ends[i]].t+Vec{delta.dot(right),delta.dot(forward),delta.z}/scale*(weights[i]*smooth(transition));
-                                lib.ik(p,starts[i],mids[i],ends[i],target,w[mids[i]].t);
+                                solveIK(p,starts[i],mids[i],ends[i],target,w[mids[i]].t);
                                 lib.contactOrientation(p,ends[i],authored[ends[i]].q,ankleOrientation);
                                 if(weights[i]>.9f){++contactCount;++runFootContacts;}
                             }
@@ -667,7 +739,25 @@ public:
                     const float offset=i<2?5.f:8.f;
                     const Vec surface=hit->normal.unit();
                     const Vec target=nominal+surface*(offset*scale-(nominal-hit->point).dot(surface));
-                    if((target-nominal).length()<10*scale){c.point=target;c.valid=true;c.retiring=false;c.weight=std::min(c.weight,dt*10);}
+                    if((target-nominal).length()<10*scale) {
+                        if(c.rejected&&(target-c.rejectedPoint).length()<.25f*scale){c.weight=0;continue;}
+                        if(stationaryIdle) {
+                            const auto goal=toLocal(target),start=w[starts[i]].t;
+                            const float reach=(w[mids[i]].t-start).length()+(w[ends[i]].t-w[mids[i]].t).length();
+                            bool supported=(goal-start).length()<=reach+.5f;
+                            if(supported&&i<2) {
+                                const Vec reachable=(goal-start).length()>reach-.04f?start+(goal-start).unit()*(reach-.04f):goal;
+                                const Vec weighted=w[ends[i]].t+(reachable-w[ends[i]].t)*weights[i];
+                                auto checked=p;solveIK(checked,starts[i],mids[i],ends[i],weighted,w[mids[i]].t);
+                                supported=angleBetween(authored[starts[i]].q,checked[starts[i]].q)<=.65f&&
+                                    angleBetween(authored[mids[i]].q,checked[mids[i]].q)<=.75f&&lib.armBendValid(checked,i);
+                            }
+                            if(!supported) {
+                                c.point=target;rejectIdleContact(i);c.weight=0;continue;
+                            }
+                        }
+                        c.rejected=false;c.point=target;c.valid=true;c.retiring=false;c.weight=std::min(c.weight,dt*10);
+                    }
                 }
             }
             if(!c.valid)continue;
@@ -675,7 +765,7 @@ public:
             const float reach=(w[mids[i]].t-start).length()+(w[ends[i]].t-w[mids[i]].t).length();
             if((target-start).length()>reach+.5f){
                 if(!c.retiring)++retiredContacts;
-                c.retiring=true;
+                c.retiring=true;rejectIdleContact(i);
             }
             if((target-start).length()>reach-.04f)target=start+(target-start).unit()*(reach-.04f);
 
@@ -684,12 +774,12 @@ public:
             const Vec pole=w[mids[i]].t;
             const Vec original=w[ends[i]].t;
             target=original+(target-original)*c.weight;
-            maxReachError=std::max(maxReachError,lib.ik(p,starts[i],mids[i],ends[i],target,pole)*scale);
+            maxReachError=std::max(maxReachError,solveIK(p,starts[i],mids[i],ends[i],target,pole)*scale);
 
             if(i<2&&(angleBetween(authored[starts[i]].q,p[starts[i]].q)>.65f||
                 angleBetween(authored[mids[i]].q,p[mids[i]].q)>.75f)) {
                 p[starts[i]]=authored[starts[i]];p[mids[i]]=authored[mids[i]];
-                c.retiring=true;++retiredContacts;continue;
+                c.retiring=true;rejectIdleContact(i);++retiredContacts;continue;
             }
             lib.contactOrientation(p,ends[i],localOrientation,orientation);++contactCount;
         }
@@ -718,7 +808,7 @@ public:
                 if(lift<=0)continue;
                 const int upper=hand?31:28,elbow=hand?32:29,wrist=hand?39:38;
                 const auto orientation=body[wrist].q,local=p[wrist].q;
-                lib.ik(p,upper,elbow,wrist,body[wrist].t+Vec{0,0,lift},body[elbow].t);
+                solveIK(p,upper,elbow,wrist,body[wrist].t+Vec{0,0,lift},body[elbow].t);
                 lib.contactOrientation(p,wrist,local,orientation);
             }
         }
@@ -732,13 +822,13 @@ public:
                     Vec target=toLocal(foot+surface*std::min(10*scale,10*scale-distance));
                     const auto orientation=w[ends[i]].q;
                     const auto localOrientation=p[ends[i]].q;
-                    lib.ik(p,starts[i],mids[i],ends[i],target,w[mids[i]].t);
+                    solveIK(p,starts[i],mids[i],ends[i],target,w[mids[i]].t);
                     lib.contactOrientation(p,ends[i],localOrientation,orientation);
                 }
             }
         }
         for(int bone:ends)p[bone].q=boundedRotation(authored[bone].q,p[bone].q,.2617994f);
-        if(newHop&&edgeAction&&started&&previous.size()==p.size()) {
+        if(!authoredPlayback&&newHop&&edgeAction&&started&&previous.size()==p.size()) {
 
             const float limit=12.566371f*dt;
             for(int hand=0;hand<2;++hand) {
@@ -767,7 +857,11 @@ public:
             }
         }
 
-        if(started&&previous.size()==p.size()&&dt>0&&!(newMantle&&topPrepared&&traversal.topPreparation()<1.f)) {
+        gripPose.update(lib,p,motion,{contacts[0].valid&&!contacts[0].retiring?contacts[0].weight:0.f,
+            contacts[1].valid&&!contacts[1].retiring?contacts[1].weight:0.f},dt,
+            !sourceTransition&&!sourceReturn&&bridge==Motion::none&&!edgeAction);
+
+        if(!authoredPlayback&&started&&previous.size()==p.size()&&dt>0&&!(newMantle&&topPrepared&&traversal.topPreparation()<1.f)) {
             const Pose target=p;float amount=1;
             const float angularLimit=(parkour||running||backFlip?18.849556f:12.566371f)*dt;
             for(std::size_t i=0;i<p.size();++i) {
@@ -776,12 +870,12 @@ public:
             }
             const auto before=lib.world(previous);
             const Vec oldRight{-lastNormal.y,lastNormal.x,0};
-            const float speed=flipping||backFlip?1500.f:running||kick||runMotion(lastMotion)?1100.f:mantle?750.f:600.f;
+            const float speed=backFlip?1500.f:running||kick||runMotion(lastMotion)?1100.f:mantle?750.f:600.f;
             const float limit=(motion!=lastMotion?std::min(speed,runMotion(lastMotion)?1100.f:600.f):speed)*dt;
             auto evaluate=[&](float candidate) {
                 for(std::size_t i=0;i<p.size();++i)p[i]=blend(previous[i],target[i],candidate);
 
-                lib.guardArmBends(p);
+                if(!authoredPlayback)lib.guardArmBends(p);
                 limitSideArm(p);
 
                 const auto after=lib.world(p);float largest=0;
@@ -822,8 +916,8 @@ public:
         if(edgeAction) {
             const auto solved=lib.world(p);
             for(int hand=0;hand<2;++hand) {
-                const auto weights=edgeWeights(hand);
-                if(std::max(weights[0],weights[1])>.95f)
+                const auto handWeights=edgeWeights(hand);
+                if(std::max(handWeights[0],handWeights[1])>.95f)
                     edgePalmError=std::max(edgePalmError,(toWorld(lib.palm(solved,hand))-edgeAnchor(hand)).length());
             }
         }
@@ -845,7 +939,7 @@ public:
 
                     auto preferred=p;preferred[upper]=authored[upper];preferred[elbow]=authored[elbow];
                     const auto preferredWorld=lib.world(preferred);
-                    lib.ik(p,upper,elbow,wrist,target,preferredWorld[elbow].t);
+                    solveIK(p,upper,elbow,wrist,target,preferredWorld[elbow].t);
                     lib.contactOrientation(p,wrist,localOrientation,orientation);
                 }
                 if(load>.98f)topPalmError=std::max(topPalmError,(anchor-lib.palm(lib.world(p),hand)).length()*scale);
@@ -885,7 +979,7 @@ public:
             if(lift<=0)continue;
             const int upper=hand?31:28,elbow=hand?32:29,wrist=hand?39:38;
             const auto orientation=body[wrist].q,local=p[wrist].q;
-            lib.ik(p,upper,elbow,wrist,body[wrist].t+Vec{0,0,lift},body[elbow].t);
+            solveIK(p,upper,elbow,wrist,body[wrist].t+Vec{0,0,lift},body[elbow].t);
             lib.contactOrientation(p,wrist,local,orientation);
         }
         if(newMantle&&!traversal.preciseTopContacts())for(int hand=0;hand<2;++hand) {
@@ -923,7 +1017,7 @@ public:
             if(lift<=0)continue;
             const int upper=hand?31:28,elbow=hand?32:29,wrist=hand?39:38;
             const auto orientation=body[wrist].q,local=p[wrist].q;
-            lib.ik(p,upper,elbow,wrist,body[wrist].t+localNormal*lift,body[elbow].t);
+            solveIK(p,upper,elbow,wrist,body[wrist].t+localNormal*lift,body[elbow].t);
             lib.contactOrientation(p,wrist,local,orientation);
         }
 
@@ -944,11 +1038,11 @@ public:
                     const auto delta=target-before;const float limit=420*dt*scale;
                     if(delta.length()>limit)target=before+delta.unit()*limit;
                 }
-                lib.ik(p,hip,knee,ankle,toLocal(target),w[knee].t);
+                solveIK(p,hip,knee,ankle,toLocal(target),w[knee].t);
                 lib.contactOrientation(p,ankle,authored[ankle].q,w[ankle].q);
             }
         }
-        if(mantle&&started&&previous.size()==p.size()) {
+        if(!authoredPlayback&&mantle&&started&&previous.size()==p.size()) {
 
             const auto oldWorld=lib.world(previous);const Vec oldRight{-lastNormal.y,lastNormal.x,0};
             for(int leg=0;leg<2;++leg) {
@@ -957,18 +1051,18 @@ public:
                 const Vec old=lastPosition+(oldRight*oldWorld[ankle].t.x-lastNormal*oldWorld[ankle].t.y+Vec{0,0,oldWorld[ankle].t.z})*scale;
                 const Vec delta=toWorld(w[ankle].t)-old;const float limit=750*dt*scale;
                 if(delta.length()>limit) {
-                    lib.ik(p,hip,knee,ankle,toLocal(old+delta.unit()*limit),w[knee].t);
+                    solveIK(p,hip,knee,ankle,toLocal(old+delta.unit()*limit),w[knee].t);
                     lib.contactOrientation(p,ankle,authored[ankle].q,w[ankle].q);
                 }
             }
         }
-        const auto correctedArms=lib.guardArmBends(p);
+        const auto correctedArms=authoredPlayback?0:lib.guardArmBends(p);
         for(int hand=0;hand<2;++hand)if(correctedArms&(1u<<hand)) {
-            contacts[hand].retiring=true;
+            contacts[hand].retiring=true;rejectIdleContact(hand);
             if(sidewaysRun)sidePalmContact=false;
         }
-        lib.forearmTwist(p);
-        if(wallTargets||threepeatMotion(motion)||(threepeatMotion(lastMotion)&&transition<1)) {
+        if(!authoredPlayback)lib.forearmTwist(p);
+        if(!authoredPlayback&&(wallTargets||threepeatMotion(motion)||(threepeatMotion(lastMotion)&&transition<1))) {
 
             auto legal=[&](Pose& value) {
                 lib.guardArmBends(value);
@@ -1034,11 +1128,11 @@ public:
                 }
                 const Vec desired=body[ankle].t+Vec{shift.dot(right),shift.dot(forward),shift.z}/scale;
                 const auto orientation=body[ankle].q,local=value[ankle].q;
-                lib.ik(value,hip,knee,ankle,desired,body[knee].t);lib.contactOrientation(value,ankle,local,orientation);
+                solveIK(value,hip,knee,ankle,desired,body[knee].t);lib.contactOrientation(value,ankle,local,orientation);
             }
         };
         clearAdaptiveFeet(p);
-        if(newMantle&&started&&previous.size()==p.size()) {
+        if(!authoredPlayback&&newMantle&&started&&previous.size()==p.size()) {
             const Pose desired=p;const auto before=lib.world(previous);const Vec oldRight{-lastNormal.y,lastNormal.x,0};
             const float angularLimit=12.566371f*dt;
             const float targetSpeed=750.f;
@@ -1047,9 +1141,9 @@ public:
             auto candidate=[&](float amount) {
                 for(std::size_t bone=0;bone<p.size();++bone)p[bone]=blend(previous[bone],desired[bone],amount);
                 clearAdaptiveFeet(p);
-                lib.guardArmBends(p);
+                if(!authoredPlayback)lib.guardArmBends(p);
                 for(int hand=0;hand<2;++hand)lib.guardWristFlexion(p,hand);
-                lib.forearmTwist(p);
+                if(!authoredPlayback)lib.forearmTwist(p);
                 if(newMantle&&traversal.topPreparation()>=.75f&&samplePhase<.20f) {
                     const auto body=lib.world(p);float lift=0;
                     for(int hand=0;hand<2;++hand)for(int digit=0;digit<5;++digit)for(int joint=0;joint<4;++joint) {
@@ -1153,8 +1247,8 @@ public:
 
             const auto displayed=lib.world(p);edgePalmError=0;
             for(int hand=0;hand<2;++hand) {
-                const auto weights=edgeWeights(hand);
-                if(std::max(weights[0],weights[1])>.95f)
+                const auto handWeights=edgeWeights(hand);
+                if(std::max(handWeights[0],handWeights[1])>.95f)
                     edgePalmError=std::max(edgePalmError,(toWorld(lib.palm(displayed,hand))-edgeAnchor(hand)).length());
             }
         }
@@ -1162,8 +1256,61 @@ public:
             const auto displayed=lib.world(p);
             for(int hand=0;hand<2;++hand)surfacePalmGaps[hand]=(toWorld(lib.palm(displayed,hand))-measuredPoint).dot(measuredNormal);
         }
+        if(authoredPlayback) {
+            const bool retained=!motionChanged&&previousAuthored.size()==p.size()&&previous.size()==p.size();
+            for(std::size_t bone=0;bone<p.size();++bone) {
+                const bool extremity=bone==8||bone==11||bone==38||bone==39;
+                auto correction=boundedRotation({},(authored[bone].q.inverse()*p[bone].q).unit(),extremity?.2617994f:.7853982f);
+                const auto before=retained?(previousAuthored[bone].q.inverse()*previous[bone].q).unit():Quat{};
+                correction=boundedRotation(before,correction,12.566371f*dt);
+                p[bone].q=(authored[bone].q*correction).unit();
+                Vec delta=p[bone].t-authored[bone].t;
+                if(delta.length()>20)delta=delta.unit()*20;
+                const Vec prior=retained?previous[bone].t-previousAuthored[bone].t:Vec{};
+                const Vec change=delta-prior;const float step=240.f*dt;
+                if(change.length()>step)delta=prior+change.unit()*step;
+                p[bone].t=authored[bone].t+delta;
+            }
+            for(int hand=0;hand<2;++hand)if(lib.armBendValid(authored,hand)&&!lib.armBendValid(p,hand)) {
+                const int elbow=hand?32:29;const auto desired=p[elbow].q;
+                float low=0,high=1;p[elbow].q=authored[elbow].q;
+                auto accepted=p[elbow].q;
+                for(int pass=0;pass<14;++pass) {
+                    const float amount=(low+high)*.5f;p[elbow].q=blend(authored[elbow].q,desired,amount);
+                    if(lib.armBendValid(p,hand)){low=amount;accepted=p[elbow].q;}else high=amount;
+                }
+                p[elbow].q=accepted;contacts[hand].retiring=true;
+            }
+            previousAuthored=authored;
+        } else {
+            previousAuthored.clear();
+            if(sourceReturn&&previous.size()==p.size()) {
+                const float angularLimit=12.566371f*dt,linearLimit=240.f*dt;
+                bool settled=transition>=1;
+                for(std::size_t bone=0;bone<p.size();++bone) {
+                    const float angle=angleBetween(previous[bone].q,p[bone].q);
+                    settled=settled&&angle<=angularLimit+.00001f;
+                    p[bone].q=boundedRotation(previous[bone].q,p[bone].q,angularLimit);
+                    if(bone==0||bone==4) {
+                        const auto delta=p[bone].t-previous[bone].t;
+                        if(delta.length()>linearLimit){p[bone].t=previous[bone].t+delta.unit()*linearLimit;settled=false;}
+                    }
+                }
+                for(int hand=0;hand<2;++hand)if(lib.armBendValid(previous,hand)&&!lib.armBendValid(p,hand)) {
+                    const int elbow=hand?32:29;const auto desired=p[elbow].q;
+                    float low=0,high=1;auto accepted=previous[elbow].q;
+                    for(int pass=0;pass<14;++pass) {
+                        const float amount=(low+high)*.5f;p[elbow].q=blend(previous[elbow].q,desired,amount);
+                        if(lib.armBendValid(p,hand)){low=amount;accepted=p[elbow].q;}else high=amount;
+                    }
+                    p[elbow].q=accepted;settled=false;
+                }
+                sourceReturn=!settled;
+            }
+        }
         penultimate=previous;previous=p;previousDt=dt;
-        lastPosition=pos;lastNormal=n;lastMotion=motion;lastWallTargets=wallTargets;started=true;
+        lastPosition=pos;lastNormal=n;lastMotion=motion;lastWallRunDirection=wallRunDirection;lastContextRecovery=contextRecovery;lastWallTargets=wallTargets;started=true;
+        lastSupportRecovery=supportRecovery;lastRecoveryStart=traversal.edgeStart();lastRecoveryTarget=traversal.edgeTarget();
         return p;
     }
 };

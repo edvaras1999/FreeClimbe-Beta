@@ -26,3 +26,30 @@ bool		FC_GetPose(int pose, float * out990);
 // ---- movimentos do pacote tocados ao longo do tempo ----
 float		FC_MotionSeconds(int motion);						// duracao real do movimento (0 se nao existe)
 bool		FC_SampleMotion(int motion, float phase, float * out990);	// pose na fase 0..1, interpolada
+
+// ---- passo 25: funcoes do original que faltavam (orientacao do corpo na parede) ----
+// Distancia (unidades) percorrida num ciclo do movimento; 0 se desconhecida.
+float		FC_MotionStride(int motion);
+
+// Como FC_MotionSeconds / FC_SampleMotion, mas escolhendo a sequencia certa de arranque/paragem da corrida
+// para a direcao ('direction' = id do movimento de corrida: 20 runUp, 21 runLeft, 22 runRight, 23/24 diagonais; 0 = nenhuma).
+float		FC_MotionSecondsDir(int motion, int direction);
+bool		FC_SampleMotionDir(int motion, float phase, int direction, float * out990);
+
+// Igual ao "placeWall" do original: poe o corpo a distancia certa da parede (maos sobre a superficie).
+// 'feet' = true para as entradas/acoes em que os pes tambem tocam a parede. A posicao do corpo fica no osso 0 (raiz) e no osso 4.
+bool		FC_PlaceWall(float * pose990, float gap, float surfaceZ, bool feet);
+
+// Igual ao "placeRun" do original: roda o corpo para a parede (corrida para cima = corpo na horizontal, pes na parede;
+// corrida de lado = corpo inclinado, com o braco de dentro apoiado). 'dirX' = esquerda(-)/direita(+), 'dirY' = baixo(-)/cima(+).
+// 'reset' = true no primeiro quadro de uma corrida (a orientacao passa a ser suavizada a partir dai).
+// O resultado fica na pose: osso 0 = enquadramento do corpo (rotacao + posicao), restantes = rotacoes locais.
+bool		FC_PlaceRun(float * pose990, float gait, float dirX, float dirY, float surfaceZ, float gap, float dt, int direction, bool reset);
+
+// Uma chamada que faz tudo: amostra o movimento (com a sequencia certa para a direcao) e coloca o corpo como o original.
+//   style 0 = parede (maos na superficie)      1 = parede com os pes (arranques da corrida)
+//   style 2 = corrida (rodada para a parede)   3 = o corpo e levado pelo personagem (so rotacoes: apanhar, passar a borda, largar)
+//   style 4 = cambalhota para tras
+// 'dirX/dirY' e 'dt' so contam na corrida; 'resetRun' = primeiro quadro de uma corrida.
+enum { FC_STYLE_WALL = 0, FC_STYLE_WALLFEET = 1, FC_STYLE_RUN = 2, FC_STYLE_BODY = 3, FC_STYLE_BACKFLIP = 4 };
+bool		FC_BuildPose(int motion, float phase, int direction, int style, float gap, float dirX, float dirY, float dt, bool resetRun, float * out990);

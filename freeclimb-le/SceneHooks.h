@@ -11,33 +11,31 @@ void SceneHooksSetTarget(unsigned root, unsigned flat);
 // Arranca uma thread que, durante ~40 s, regista no log quantas chamadas houve por segundo.
 void SceneHooksStartReport();
 
-// Passo 17: aplica ao esqueleto do jogador poses REAIS do pacote de animacoes do FreeClimb.
-// 'entryIndex' tem 99 posicoes: o indice da entrada da tabela achatada de cada osso canonico (-1 = nenhum).
+// ---- passo 25: motor de pose novo ----
+// Afinacoes: poseMode 1 = escrever os locais ANTES de cada passagem (como o original; padrao),
+// 0 = escrever o mundo DEPOIS da passagem (modo antigo, so para comparar). entryBlend/exitBlend em segundos.
+void SceneHooksConfigure(int poseMode, float entryBlend, float exitBlend);
+
+// Liga os ossos canonicos (99 posicoes: indice da entrada da tabela achatada, -1 = nenhuma).
 void SceneHooksBindBones(const int * entryIndex);
 
-// Depois de o jogador andar e parar, verifica a matematica e aplica 5 poses, uma de cada vez (6 s cada).
-void SceneHooksStartPoseTest();
+// O jogo entrega, a cada atualizacao, a pose FINAL de 99 ossos x 10 floats (osso 0 = enquadramento do corpo).
+// 'key' identifica o movimento: quando muda, faz-se uma fusao de 'blendSeconds' da pose anterior para a nova.
+// active=false: a ultima pose desvanece-se para a do motor.
+void SceneHooksSetPose(bool active, const float * pose990, int key, float blendSeconds);
 
-// ---- passo 19: reproduzir uma animacao do FreeClimb a pedido do jogo ----
-typedef void (*SceneFinishCallback)();
-
-// Toca um movimento no corpo do jogador. 'scaleY' e 'scaleZ' ajustam o deslocamento do centro do corpo
-// (para a frente e para cima) ao tamanho real da borda. 'onFinish' e chamada no fim, na thread que atualiza o esqueleto.
-bool SceneHooksPlayMotion(int motion, float scaleY, float scaleZ, SceneFinishCallback onFinish);
-bool SceneHooksIsPlaying();
+bool SceneHooksIsPlaying();			// ha uma pose a ser aplicada (incluindo o desvanecimento)
+bool SceneHooksPoseFaulted();		// o esqueleto mudou por baixo de nos: o jogo deve largar a parede (le e limpa)
 
 // Direcao para onde o corpo do jogador olha (plana, unitaria), lida da rotacao do no raiz.
 bool SceneHooksRootForward(float * x, float * y);
 
-// ---- passo 20: logica de jogo por frame e pose controlada pelo jogo ----
+// Chamada uma vez por quadro, na passagem "para baixo" do esqueleto do jogador (antes de a pose ser aplicada).
 typedef void (*SceneTickCallback)();
-
-// Chamada a cada atualizacao do esqueleto do jogador (antes de desenhar). Corre numa thread de trabalho do jogo.
 void SceneHooksSetTick(SceneTickCallback cb);
 
-// Mantem uma pose (movimento + fase 0..1) escrita no corpo a cada frame, ate ser desativada.
-void SceneHooksSetManualPose(bool active, int motion, float phase, float scaleY, float scaleZ);
-
-// ---- passo 21: reencontrar o esqueleto do jogador (o jogo reconstroi-o ao equipar, em combate, ao mudar de celula) ----
-// Volta a procurar a raiz e a tabela achatada do jogador e a ligar os ossos. Devolve true se ficou utilizavel.
+// Volta a procurar a raiz e a tabela achatada do jogador e a ligar os ossos (o jogo reconstroi-o ao equipar, em combate, ao mudar de celula).
 bool SceneHooksRefreshTarget();
+
+// (mantida por compatibilidade; o teste de poses do passo 17 foi retirado)
+void SceneHooksStartPoseTest();

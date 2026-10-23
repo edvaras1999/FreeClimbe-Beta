@@ -51,19 +51,53 @@ namespace
 		else if(s == g_playerRoot && s)	{ InterlockedIncrement(&g_rootCalls[kind]); NoteThread(); }
 	}
 
-	// ---- Passo 17: aplicar uma POSE REAL do FreeClimb ao esqueleto do jogador ----
-	// O jogo, no fim da passagem (0ABDEC0), copia a transformacao mundial de cada no para a tabela achatada,
-	// e o desenho le essas posicoes. Por isso: DEPOIS da passagem, recalculamos as posicoes mundiais da
-	// hierarquia inteira (645 entradas, pais antes dos filhos) e escrevemo-las na entrada e no no.
-	// Para os ossos canonicos a rotacao local vem da pose; o resto mantem a transformacao local atual.
-	volatile DWORD		g_poseStart = 0, g_poseEnd = 0;
-	volatile LONG		g_poseReady = 0, g_poseFrames = 0;
-	float				g_pose[99 * 10];
-	int					g_boneEntry[99];
-	volatile LONG		g_fkCheckRequested = 0, g_fkCheckDone = 0;
-	float				g_fkMaxT = 0, g_fkMaxRotDeg = 0;
-	unsigned			g_fkEntries = 0, g_fkMismatch = 0;
+	// =============================================================================================
+	// PASSO 25 - MOTOR DE POSE
+	//
+	// Como o FreeClimb original (SE) faz: a pose e escrita nas transformacoes LOCAIS dos ossos ANTES de o
+	// motor correr cada passagem de atualizacao do esqueleto, e e o proprio motor que propaga o resultado
+	// (nos, tabela achatada, pele, camara, armas...). Assim o corpo "obedece" aos ossos, em vez de se
+	// repintar so a tabela achatada depois de o motor ter acabado (modo antigo, PoseMode=0).
+	//
+	// Onde esta o local de um osso: se a entrada achatada tem no (+0x70), o motor anima o NO (local em +0x20,
+	// +0x44, +0x50); senao, a propria entrada (local em +0x00, +0x24, +0x30).
+	// =============================================================================================
+	SceneTickCallback	g_tickCb = NULL;
 	volatile LONG		g_inPose = 0;
+	int					g_boneEntry[99];
+	unsigned			g_boneNode[99];				// o no de cada osso no momento da ligacao (0 = so entrada)
+	float				g_rest[99 * 10];
+	volatile LONG		g_restReady = 0;
+
+	int					g_poseMode = 1;				// 1 = locais antes da passagem (novo); 0 = mundo depois da passagem (antigo)
+	float				g_entryBlend = 0.14f, g_exitBlend = 0.22f;
+
+	// pedido do jogo (escrito por SceneHooksSetPose) e a pose final deste quadro
+	volatile LONG		g_reqActive = 0;
+	float				g_reqPose[99 * 10];
+	int					g_reqKey = 0;
+	float				g_reqBlend = 0.15f;
+	int					g_curKey = -1;
+	bool				g_haveOut = false;
+	float				g_out[99 * 10], g_xfFrom[99 * 10];
+	float				g_xfT = 1.0f, g_xfDur = 0.15f, g_weightRaw = 0.0f;
+	volatile LONG		g_frameActive = 0;
+	float				g_frameWeight = 0.0f;
+	LARGE_INTEGER		g_qpcFreq, g_qpcLast;
+	bool				g_qpcReady = false;
+	volatile LONG		g_fault = 0;
+
+	struct Tr { float r[9]; float t[3]; float s; };		// NiTransform: rotacao 3x3 (linhas), translacao, escala
+
+	// o que foi escrito por ultimo em cada osso e o que o motor tinha antes (para nao misturar a nossa propria escrita)
+	Tr					g_written[99], g_native[99];
+	bool				g_writtenValid[99];
+
+	// estatisticas por tipo de passagem (para o log)
+	volatile LONG		g_passApplied[kKinds];
+	volatile LONG		g_passOverwritten[kKinds];
+	volatile LONG		g_framesPosed = 0;
+	DWORD				g_lastStatLog = 0;
 
 	bool ReadableMem(unsigned address, unsigned size)
 	{
@@ -90,8 +124,6 @@ namespace
 		return *entries && *count > 0 && *count <= 1024;
 	}
 
-	struct Tr { float r[9]; float t[3]; float s; };		// NiTransform: rotacao 3x3 (linhas), translacao, escala
-
 	// como o jogo multiplica transformacoes: R = Rp*Rl ; T = Tp + sp*(Rp*Tl) ; S = sp*sl
 	void Mul(const Tr & p, const Tr & l, Tr * out)
 	{
@@ -103,7 +135,18 @@ namespace
 		out->s = p.s * l.s;
 	}
 
-	// quaternio (x y z w) -> matriz; as COLUNAS sao os eixos rodados (a mesma convencao do FreeClimb/NiMatrix3)
+	// inversa de uma transformacao: R' = R^T, s' = 1/s, t' = -s' * R' * t
+	void Inv(const Tr & a, Tr * out)
+	{
+		for(int i = 0; i < 3; ++i)
+			for(int j = 0; j < 3; ++j)
+				out->r[i * 3 + j] = a.r[j * 3 + i];
+		out->s = 1.0f / a.s;
+		for(int i = 0; i < 3; ++i)
+			out->t[i] = -out->s * (out->r[i * 3 + 0] * a.t[0] + out->r[i * 3 + 1] * a.t[1] + out->r[i * 3 + 2] * a.t[2]);
+	}
+
+	// ---- quaternios (x y z w); a matriz tem as COLUNAS como os eixos rodados (convencao do jogo)
 	void FromQuat(const float * q, float * r)
 	{
 		const float x = q[0], y = q[1], z = q[2], w = q[3];
@@ -112,33 +155,283 @@ namespace
 		r[6] = 2 * (x * z - y * w);		r[7] = 2 * (y * z + x * w);		r[8] = 1 - 2 * (x * x + y * y);
 	}
 
-	float RotAngleDeg(const float * a, const float * b)
+	void ToQuat(const float * r, float * q)
 	{
-		float tr = 0;
-		for(int i = 0; i < 9; ++i) tr += a[i] * b[i];
-		float c = (tr - 1.0f) * 0.5f;
-		if(c > 1.0f) c = 1.0f;
-		if(c < -1.0f) c = -1.0f;
-		return acosf(c) * 57.29578f;
-	}
-
-	// A transformacao local ATUAL de uma entrada: do no, se tem no (o no e o que o jogo anima); senao da entrada.
-	void LiveLocal(unsigned e, Tr * out)
-	{
-		const unsigned node = *(const unsigned *)(e + 0x70);
-		if(node && ReadableMem(node + 0x20, 0x34))
+		const float trace = r[0] + r[4] + r[8];
+		if(trace > 0.0f)
 		{
-			memcpy(out->r, (const void *)(node + 0x20), 36);
-			memcpy(out->t, (const void *)(node + 0x44), 12);
-			out->s = *(const float *)(node + 0x50);
+			const float s = sqrtf(trace + 1.0f) * 2.0f;
+			q[3] = 0.25f * s; q[0] = (r[7] - r[5]) / s; q[1] = (r[2] - r[6]) / s; q[2] = (r[3] - r[1]) / s;
+		}
+		else if(r[0] > r[4] && r[0] > r[8])
+		{
+			const float s = sqrtf(1.0f + r[0] - r[4] - r[8]) * 2.0f;
+			q[3] = (r[7] - r[5]) / s; q[0] = 0.25f * s; q[1] = (r[1] + r[3]) / s; q[2] = (r[2] + r[6]) / s;
+		}
+		else if(r[4] > r[8])
+		{
+			const float s = sqrtf(1.0f + r[4] - r[0] - r[8]) * 2.0f;
+			q[3] = (r[2] - r[6]) / s; q[0] = (r[1] + r[3]) / s; q[1] = 0.25f * s; q[2] = (r[5] + r[7]) / s;
 		}
 		else
 		{
-			memcpy(out->r, (const void *)(e + 0x00), 36);
-			memcpy(out->t, (const void *)(e + 0x24), 12);
-			out->s = *(const float *)(e + 0x30);
+			const float s = sqrtf(1.0f + r[8] - r[0] - r[4]) * 2.0f;
+			q[3] = (r[3] - r[1]) / s; q[0] = (r[2] + r[6]) / s; q[1] = (r[5] + r[7]) / s; q[2] = 0.25f * s;
+		}
+		const float n = sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+		if(n > 1e-6f) { q[0] /= n; q[1] /= n; q[2] /= n; q[3] /= n; } else { q[0] = q[1] = q[2] = 0; q[3] = 1; }
+	}
+
+	void QMul(const float * a, const float * b, float * o)
+	{
+		o[0] = a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1];
+		o[1] = a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0];
+		o[2] = a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3];
+		o[3] = a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2];
+	}
+
+	void QRotate(const float * q, const float * v, float * o)
+	{
+		const float ax = q[0], ay = q[1], az = q[2], w = q[3];
+		const float tx = 2 * (ay * v[2] - az * v[1]), ty = 2 * (az * v[0] - ax * v[2]), tz = 2 * (ax * v[1] - ay * v[0]);
+		o[0] = v[0] + tx * w + (ay * tz - az * ty);
+		o[1] = v[1] + ty * w + (az * tx - ax * tz);
+		o[2] = v[2] + tz * w + (ax * ty - ay * tx);
+	}
+
+	void QSlerp(const float * a, const float * b, float t, float * o)
+	{
+		float bb[4] = { b[0], b[1], b[2], b[3] };
+		float d = a[0] * bb[0] + a[1] * bb[1] + a[2] * bb[2] + a[3] * bb[3];
+		if(d < 0.0f) { bb[0] = -bb[0]; bb[1] = -bb[1]; bb[2] = -bb[2]; bb[3] = -bb[3]; d = -d; }
+		float u = 1.0f - t, v = t;
+		if(d < 0.9995f)
+		{
+			const float angle = acosf(d > 1.0f ? 1.0f : d), sn = sinf(angle);
+			u = sinf((1.0f - t) * angle) / sn; v = sinf(t * angle) / sn;
+		}
+		o[0] = a[0] * u + bb[0] * v; o[1] = a[1] * u + bb[1] * v; o[2] = a[2] * u + bb[2] * v; o[3] = a[3] * u + bb[3] * v;
+		const float n = sqrtf(o[0] * o[0] + o[1] * o[1] + o[2] * o[2] + o[3] * o[3]);
+		if(n > 1e-6f) { o[0] /= n; o[1] /= n; o[2] /= n; o[3] /= n; } else { o[0] = o[1] = o[2] = 0; o[3] = 1; }
+	}
+
+	float Ease(float t) { if(t < 0) t = 0; if(t > 1) t = 1; return t * t * (3.0f - 2.0f * t); }
+
+	bool FinitePose(const float * p)
+	{
+		for(int i = 0; i < 99 * 10; ++i) if(!(p[i] == p[i]) || p[i] > 1e6f || p[i] < -1e6f) return false;
+		return true;
+	}
+
+	// Mistura duas poses de 99 ossos (rotacao: slerp; translacao e escala: linear).
+	void BlendPoses(const float * a, const float * b, float t, float * out)
+	{
+		for(int i = 0; i < 99; ++i)
+		{
+			const float * pa = a + i * 10, * pb = b + i * 10;
+			float * po = out + i * 10;
+			for(int k = 0; k < 3; ++k) po[k] = pa[k] + (pb[k] - pa[k]) * t;
+			QSlerp(pa + 3, pb + 3, t, po + 3);
+			for(int k = 7; k < 10; ++k) po[k] = pa[k] + (pb[k] - pa[k]) * t;
 		}
 	}
+
+	// Um osso: o 'local' entra com o que o motor tem (nativo) e sai com o que queremos escrever.
+	//  - todos os ossos: rotacao = mistura(nativo, pose) com o peso do quadro;
+	//  - o centro do corpo (4): tambem recebe o deslocamento da pose e o ENQUADRAMENTO da raiz autoral (osso 0:
+	//    e ai que o original poe a distancia a parede e a rotacao do corpo para a parede/corrida).
+	void ComposeBone(int bone, Tr * local)
+	{
+		const float w = g_frameWeight;
+		const float * p = g_out + bone * 10;
+		float qn[4];
+		ToQuat(local->r, qn);
+
+		float q[4];
+		QSlerp(qn, p + 3, w, q);
+
+		if(bone != 4)
+		{
+			FromQuat(q, local->r);
+			return;
+		}
+
+		float t[3];
+		for(int k = 0; k < 3; ++k) t[k] = local->t[k] + (p[k] - g_rest[4 * 10 + k]) * w;
+
+		const float * root = g_out;						// osso 0 = enquadramento do corpo
+		const float identity[4] = { 0, 0, 0, 1 };
+		float fq[4];
+		QSlerp(identity, root + 3, w, fq);
+
+		float rt[3], fx[3] = { t[0], t[1], t[2] };
+		QRotate(fq, fx, rt);
+		local->t[0] = rt[0] + root[0] * w; local->t[1] = rt[1] + root[1] * w; local->t[2] = rt[2] + root[2] * w;
+
+		float qq[4];
+		QMul(fq, q, qq);
+		FromQuat(qq, local->r);
+	}
+
+	// Uma vez por quadro (na passagem "para baixo"): decide a pose final, com fusao de entrada, de saida e entre movimentos.
+	void BeginFrame()
+	{
+		if(!g_qpcReady) { QueryPerformanceFrequency(&g_qpcFreq); QueryPerformanceCounter(&g_qpcLast); g_qpcReady = true; }
+		LARGE_INTEGER now; QueryPerformanceCounter(&now);
+		float dt = (float)((double)(now.QuadPart - g_qpcLast.QuadPart) / (double)g_qpcFreq.QuadPart);
+		g_qpcLast = now;
+		if(!(dt >= 0.0f)) dt = 0.0f;
+		if(dt > 0.1f) dt = 0.1f;
+
+		if(g_reqActive && g_restReady && FinitePose(g_reqPose))
+		{
+			if(g_curKey != g_reqKey)
+			{
+				if(g_haveOut && g_weightRaw > 0.05f && g_reqBlend > 0.001f)
+				{
+					memcpy(g_xfFrom, g_out, sizeof(g_out));
+					g_xfT = 0.0f; g_xfDur = g_reqBlend;
+				}
+				else g_xfT = 1.0f;
+				g_curKey = g_reqKey;
+			}
+
+			if(g_xfT < 1.0f)
+			{
+				g_xfT += dt / g_xfDur;
+				if(g_xfT > 1.0f) g_xfT = 1.0f;
+				BlendPoses(g_xfFrom, g_reqPose, Ease(g_xfT), g_out);
+			}
+			else memcpy(g_out, g_reqPose, sizeof(g_out));
+			g_haveOut = true;
+
+			g_weightRaw = g_entryBlend > 0.001f ? g_weightRaw + dt / g_entryBlend : 1.0f;
+			if(g_weightRaw > 1.0f) g_weightRaw = 1.0f;
+		}
+		else
+		{
+			// sem pedido: a ultima pose desvanece-se para a do motor
+			g_curKey = -1;
+			if(g_haveOut)
+			{
+				g_weightRaw = g_exitBlend > 0.001f ? g_weightRaw - dt / g_exitBlend : 0.0f;
+				if(g_weightRaw <= 0.0f) { g_weightRaw = 0.0f; g_haveOut = false; }
+			}
+			else g_weightRaw = 0.0f;
+		}
+
+		g_frameWeight = Ease(g_weightRaw);
+		InterlockedExchange(&g_frameActive, (g_haveOut && g_frameWeight > 0.0f) ? 1 : 0);
+	}
+
+	// ---- modo novo: escrever os locais antes da passagem ----
+	bool BindingStillValid(unsigned entries, unsigned count)
+	{
+		if(!ReadableMem(entries, count * 0x78)) return false;
+		for(int b = 0; b < 99; ++b)
+		{
+			const int idx = g_boneEntry[b];
+			if(idx < 0) continue;
+			if((unsigned)idx >= count) return false;
+			if(*(const unsigned *)(entries + (unsigned)idx * 0x78 + 0x70) != g_boneNode[b]) return false;
+		}
+		return true;
+	}
+
+	unsigned ApplyLocals(unsigned entries)
+	{
+		unsigned wrote = 0;
+		for(int b = 0; b < 99; ++b)
+		{
+			const int idx = g_boneEntry[b];
+			if(idx < 0) continue;
+
+			const unsigned e = entries + (unsigned)idx * 0x78;
+			const unsigned node = g_boneNode[b];
+			float * rot = node ? (float *)(node + 0x20) : (float *)(e + 0x00);
+			float * tr  = node ? (float *)(node + 0x44) : (float *)(e + 0x24);
+
+			Tr cur;
+			memcpy(cur.r, rot, 36); memcpy(cur.t, tr, 12); cur.s = 1.0f;
+
+			// se o que la esta e o que escrevemos ha pouco (outra passagem do mesmo quadro), o "nativo" e o que guardamos
+			const bool ours = g_writtenValid[b] && memcmp(cur.r, g_written[b].r, 36) == 0 && (b != 4 || memcmp(cur.t, g_written[b].t, 12) == 0);
+			if(!ours) g_native[b] = cur;
+
+			Tr local = g_native[b];
+			ComposeBone(b, &local);
+
+			memcpy(rot, local.r, 36);
+			if(b == 4) memcpy(tr, local.t, 12);
+			g_written[b] = local;
+			if(b != 4) memcpy(g_written[b].t, cur.t, 12);
+			g_writtenValid[b] = true;
+			++wrote;
+		}
+		return wrote;
+	}
+
+	unsigned CountOverwritten(unsigned entries)
+	{
+		unsigned bad = 0;
+		for(int b = 0; b < 99; ++b)
+		{
+			const int idx = g_boneEntry[b];
+			if(idx < 0 || !g_writtenValid[b]) continue;
+			const unsigned e = entries + (unsigned)idx * 0x78;
+			const unsigned node = g_boneNode[b];
+			const float * rot = node ? (const float *)(node + 0x20) : (const float *)(e + 0x00);
+			if(memcmp(rot, g_written[b].r, 36) != 0) ++bad;
+		}
+		return bad;
+	}
+
+	void LogStats(unsigned flat)
+	{
+		const DWORD now = GetTickCount();
+		if(now - g_lastStatLog < 1000) return;
+		g_lastStatLog = now;
+		unsigned bound = 0;
+		for(int b = 0; b < 99; ++b) if(g_boneEntry[b] >= 0) ++bound;
+		_MESSAGE("pose: mode %d, weight %.2f, %u bones bound | passes posed (down/sel/rigid/transform/world): %ld/%ld/%ld/%ld/%ld | overwritten by the engine after the pass: %ld/%ld/%ld/%ld/%ld",
+				 g_poseMode, (double)g_frameWeight, bound,
+				 g_passApplied[kDownward], g_passApplied[kSelected], g_passApplied[kRigid], g_passApplied[kTransform], g_passApplied[kWorld],
+				 g_passOverwritten[kDownward], g_passOverwritten[kSelected], g_passOverwritten[kRigid], g_passOverwritten[kTransform], g_passOverwritten[kWorld]);
+		for(int k = 0; k < kKinds; ++k) { g_passApplied[k] = 0; g_passOverwritten[k] = 0; }
+	}
+
+	// Antes de cada passagem da tabela achatada do jogador.
+	bool PrePass(int kind, unsigned flat, unsigned * entriesOut)
+	{
+		if(kind == kDownward)
+		{
+			if(g_tickCb) g_tickCb();			// a logica de jogo decide a pose deste quadro
+			BeginFrame();
+		}
+		if(!g_frameActive) return false;
+
+		unsigned entries, count;
+		if(!FlatArray(flat, &entries, &count)) return false;
+		if(!BindingStillValid(entries, count)) { InterlockedExchange(&g_fault, 1); return false; }
+		if(InterlockedCompareExchange(&g_inPose, 1, 0) != 0) return false;
+
+		ApplyLocals(entries);
+		InterlockedExchange(&g_inPose, 0);
+		InterlockedIncrement(&g_passApplied[kind]);
+		if(kind == kDownward) InterlockedIncrement(&g_framesPosed);
+		*entriesOut = entries;
+		return true;
+	}
+
+	void PostPassAudit(int kind, unsigned flat, unsigned entries)
+	{
+		const unsigned bad = CountOverwritten(entries);
+		if(bad) InterlockedExchangeAdd(&g_passOverwritten[kind], 1);
+		if(kind == kDownward) LogStats(flat);
+	}
+
+	// ---- modo antigo (PoseMode=0): recalcula o mundo de toda a hierarquia DEPOIS da passagem e escreve-o ----
+	Tr g_live[1024], g_world[1024];
 
 	void ReadWorld(unsigned base, unsigned rotOff, unsigned tOff, unsigned sOff, Tr * out)
 	{
@@ -154,49 +447,15 @@ namespace
 		*(float *)(base + sOff) = w.s;
 	}
 
-	// ---- reproducao no tempo (passo 18) ----
-	volatile LONG		g_playing = 0, g_playFrames = 0, g_restReady = 0;
-	int					g_playMotion = 0;
-	float				g_playSeconds = 1.0f;
-	volatile DWORD		g_playStart = 0;
-	float				g_rest[99 * 10];
-	float				g_scaleY = 1.0f, g_scaleZ = 1.0f;
-	SceneFinishCallback	g_finishCb = NULL;
-	SceneTickCallback	g_tickCb = NULL;
-	volatile LONG		g_manual = 0;
-	int					g_manualMotion = 1;
-	float				g_manualPhase = 0.0f;
-	unsigned			g_fkBadIdx[12], g_fkBadCount = 0;
-	float				g_fkRecT = 0, g_fkRecRot = 0;
-
-	Tr g_live[1024], g_world[1024], g_world2[1024];
-
-	// inversa de uma transformacao: R' = R^T, s' = 1/s, t' = -s' * R' * t
-	void Inv(const Tr & a, Tr * out)
-	{
-		for(int i = 0; i < 3; ++i)
-			for(int j = 0; j < 3; ++j)
-				out->r[i * 3 + j] = a.r[j * 3 + i];
-		out->s = 1.0f / a.s;
-		for(int i = 0; i < 3; ++i)
-			out->t[i] = -out->s * (out->r[i * 3 + 0] * a.t[0] + out->r[i * 3 + 1] * a.t[1] + out->r[i * 3 + 2] * a.t[2]);
-	}
-
-	// Calcula as posicoes mundiais de todas as entradas.
-	// A transformacao local de cada osso e a EFETIVA: a que reproduz exatamente o mundo que o jogo acabou de calcular
-	// (inversa(mundo do pai) * mundo do osso). Assim, ossos de fisica ou com sinalizadores especiais ficam como estao.
-	// Se 'usePose', os ossos canonicos recebem a rotacao da pose; o osso do centro do corpo (4) recebe tambem o
-	// deslocamento da pose em relacao ao repouso autoral (e ai que esta a subida de uma escalada).
-	bool ComputeWorlds(unsigned flat, bool usePose, unsigned entries, unsigned count)
+	bool ComputeWorlds(unsigned flat, unsigned entries, unsigned count)
 	{
 		int boneOfEntry[1024];
 		for(unsigned i = 0; i < count; ++i) boneOfEntry[i] = -1;
-		if(usePose)
-			for(int b = 0; b < 99; ++b)
-				if(g_boneEntry[b] >= 0 && (unsigned)g_boneEntry[b] < count) boneOfEntry[g_boneEntry[b]] = b;
+		for(int b = 0; b < 99; ++b)
+			if(g_boneEntry[b] >= 0 && (unsigned)g_boneEntry[b] < count) boneOfEntry[g_boneEntry[b]] = b;
 
 		Tr root;
-		ReadWorld(flat, 0x54, 0x78, 0x84, &root);		// a propria tabela e o "pai" das entradas de topo
+		ReadWorld(flat, 0x54, 0x78, 0x84, &root);
 
 		for(unsigned i = 0; i < count; ++i)
 		{
@@ -209,115 +468,37 @@ namespace
 		{
 			const unsigned e = entries + i * 0x78;
 			const int parent = (int)(short)(*(const unsigned short *)(e + 0x68));
-			if(parent >= (int)i) return false;											// ordem inesperada: nao arriscar
+			if(parent >= (int)i) return false;
 
 			Tr inv, local;
 			Inv(parent >= 0 ? g_live[parent] : root, &inv);
-			Mul(inv, g_live[i], &local);												// local efetiva
+			Mul(inv, g_live[i], &local);					// local efetiva
 
 			const int bone = boneOfEntry[i];
-			if(bone >= 0)
-			{
-				const float * p = g_pose + bone * 10;
-				FromQuat(p + 3, local.r);
-				if(bone == 4 && g_restReady)											// centro do corpo: soma o deslocamento da pose
-				{
-					local.t[0] += (p[0] - g_rest[bone * 10 + 0]) * ((g_scaleY == 0.0f && g_scaleZ == 0.0f) ? 0.0f : 1.0f);
-					local.t[1] += (p[1] - g_rest[bone * 10 + 1]) * g_scaleY;			// para a frente, ajustado a borda
-					local.t[2] += (p[2] - g_rest[bone * 10 + 2]) * g_scaleZ;			// para cima, ajustado a borda
-				}
-			}
+			if(bone >= 0) ComposeBone(bone, &local);
 			Mul(parent >= 0 ? g_world[parent] : root, local, &g_world[i]);
 		}
 		return true;
 	}
 
-	// Depois da atualizacao do esqueleto do jogador.
-	void PostPass(unsigned flat)
+	void LegacyPostPass(unsigned flat)
 	{
-		if(g_tickCb) g_tickCb();									// a logica de jogo decide a pose deste frame
-
-		const bool manual = g_manual != 0;
-		const bool playing = (g_playing || manual) && g_restReady;
-		if(!playing && !g_fkCheckRequested) return;
-
+		if(!g_frameActive) return;
 		unsigned entries, count;
 		if(!FlatArray(flat, &entries, &count)) return;
 		if(InterlockedCompareExchange(&g_inPose, 1, 0) != 0) return;
-
-		bool finished = false;
-		if(playing)
+		if(ComputeWorlds(flat, entries, count))
 		{
-			int motion = g_playMotion;
-			float phase;
-			if(manual)
-			{
-				motion = g_manualMotion;
-				phase = g_manualPhase;
-			}
-			else
-			{
-				phase = (float)(GetTickCount() - g_playStart) / 1000.0f / g_playSeconds;
-				if(phase >= 1.0f) { phase = 1.0f; finished = true; }
-			}
-
-			if(FC_SampleMotion(motion, phase, g_pose) && ComputeWorlds(flat, true, entries, count))
-			{
-				for(unsigned i = 0; i < count; ++i)
-				{
-					const unsigned e = entries + i * 0x78;
-					WriteWorld(e, 0x34, 0x58, 0x64, g_world[i]);						// entrada: mundo em +0x34
-					const unsigned node = *(const unsigned *)(e + 0x70);
-					if(node && ReadableMem(node + 0x54, 0x34)) WriteWorld(node, 0x54, 0x78, 0x84, g_world[i]);	// no: mundo em +0x54
-				}
-				InterlockedIncrement(&g_playFrames);
-			}
-		}
-		else if(g_fkCheckRequested && ComputeWorlds(flat, false, entries, count))
-		{
-			// (A) a reconstrucao a partir das locais efetivas reproduz o mundo do jogo? (testa Mul e Inv)
-			float recT = 0, recRot = 0;
-			for(unsigned i = 0; i < count; ++i)
-			{
-				float dt = 0;
-				for(int k = 0; k < 3; ++k) { const float d = fabsf(g_live[i].t[k] - g_world[i].t[k]); if(d > dt) dt = d; }
-				const float dr = RotAngleDeg(g_live[i].r, g_world[i].r);
-				if(dt > recT) recT = dt;
-				if(dr > recRot) recRot = dr;
-			}
-
-			// (B) a hierarquia com as locais "diretas" (do no ou da entrada) bate com o mundo do jogo? Quais nao?
-			Tr root; ReadWorld(flat, 0x54, 0x78, 0x84, &root);
-			unsigned bad = 0, kept = 0; float maxT = 0, maxRot = 0;
 			for(unsigned i = 0; i < count; ++i)
 			{
 				const unsigned e = entries + i * 0x78;
-				Tr local; LiveLocal(e, &local);
-				const int parent = (int)(short)(*(const unsigned short *)(e + 0x68));
-				Mul(parent >= 0 ? g_world2[parent] : root, local, &g_world2[i]);
-
-				float dt = 0;
-				for(int k = 0; k < 3; ++k) { const float d = fabsf(g_live[i].t[k] - g_world2[i].t[k]); if(d > dt) dt = d; }
-				const float dr = RotAngleDeg(g_live[i].r, g_world2[i].r);
-				if(dt > maxT) maxT = dt;
-				if(dr > maxRot) maxRot = dr;
-				if(dt > 0.5f || dr > 1.0f) { if(kept < 12) g_fkBadIdx[kept++] = i; ++bad; }
+				WriteWorld(e, 0x34, 0x58, 0x64, g_world[i]);
+				const unsigned node = *(const unsigned *)(e + 0x70);
+				if(node && ReadableMem(node + 0x54, 0x34)) WriteWorld(node, 0x54, 0x78, 0x84, g_world[i]);
 			}
-			g_fkRecT = recT; g_fkRecRot = recRot;
-			g_fkMaxT = maxT; g_fkMaxRotDeg = maxRot; g_fkEntries = count; g_fkMismatch = bad; g_fkBadCount = kept;
-			InterlockedExchange(&g_fkCheckRequested, 0);
-			InterlockedExchange(&g_fkCheckDone, 1);
+			InterlockedIncrement(&g_framesPosed);
 		}
-
 		InterlockedExchange(&g_inPose, 0);
-
-		if(finished)
-		{
-			InterlockedExchange(&g_playing, 0);
-			SceneFinishCallback cb = g_finishCb;
-			g_finishCb = NULL;
-			if(cb) cb();
-		}
 	}
 
 	typedef void (__thiscall * Fn2)(void *, void *, unsigned);	// (this, dados, flags)  ret 8
@@ -329,25 +510,26 @@ namespace
 		static void __fastcall call(void * self, void *, void * data, unsigned flags)
 		{
 			Count(K, self);
+			const bool player = (T == kFlatTree) && ((unsigned)self == g_playerFlat) && g_playerFlat;
+			if(player && g_poseMode == 1)
+			{
+				unsigned entries = 0;
+				const bool posed = PrePass(K, (unsigned)self, &entries);
+				original(self, data, flags);
+				if(posed) PostPassAudit(K, (unsigned)self, entries);
+				return;
+			}
+
 			original(self, data, flags);
+			if(player && K == kDownward)
+			{
+				if(g_tickCb) g_tickCb();
+				BeginFrame();
+				LegacyPostPass((unsigned)self);
+			}
 		}
 	};
 	template<int T, int K> Fn2 Pass2<T, K>::original = NULL;
-
-	// A passagem "para baixo" da tabela achatada leva a experiencia (so para o esqueleto do jogador).
-	template<> struct Pass2<kFlatTree, kDownward>
-	{
-		static Fn2 original;
-		static void __fastcall call(void * self, void *, void * data, unsigned flags)
-		{
-			Count(kDownward, self);
-			const bool player = ((unsigned)self == g_playerFlat && g_playerFlat);
-
-			original(self, data, flags);
-			if(player) PostPass((unsigned)self);
-		}
-	};
-	Fn2 Pass2<kFlatTree, kDownward>::original = NULL;
 
 	template<int T, int K> struct Pass1
 	{
@@ -355,6 +537,15 @@ namespace
 		static void __fastcall call(void * self, void *, void * data)
 		{
 			Count(K, self);
+			const bool player = (T == kFlatTree) && (K == kTransform) && ((unsigned)self == g_playerFlat) && g_playerFlat;
+			if(player && g_poseMode == 1)
+			{
+				unsigned entries = 0;
+				const bool posed = PrePass(K, (unsigned)self, &entries);
+				original(self, data);
+				if(posed) PostPassAudit(K, (unsigned)self, entries);
+				return;
+			}
 			original(self, data);
 		}
 	};
@@ -457,133 +648,72 @@ void SceneHooksStartReport()
 
 namespace
 {
-	// Posicao mundial do no raiz do jogador (translacao em +0x78).
-	bool PlayerPos(float * p)
+	// Atribui a cada osso canonico o no (ou so a entrada) de que e feito. Chamar com o bloqueio g_inPose.
+	void FillBoneNodes(unsigned flat)
 	{
-		const unsigned root = g_playerRoot;
-		if(!root || !ReadableMem(root + 0x78, 12)) return false;
-		memcpy(p, (const void *)(root + 0x78), 12);
-		return true;
+		unsigned entries, count;
+		for(int b = 0; b < 99; ++b) { g_boneNode[b] = 0; g_writtenValid[b] = false; }
+		if(!flat || !FlatArray(flat, &entries, &count) || !ReadableMem(entries, count * 0x78)) return;
+
+		for(int b = 0; b < 99; ++b)
+		{
+			const int idx = g_boneEntry[b];
+			if(idx < 0 || (unsigned)idx >= count) { g_boneEntry[b] = -1; continue; }
+			const unsigned node = *(const unsigned *)(entries + (unsigned)idx * 0x78 + 0x70);
+			if(node && !ReadableMem(node, 0x58)) { g_boneEntry[b] = -1; continue; }	// no ilegivel: nao mexer
+			g_boneNode[b] = node;
+		}
 	}
+}
 
-	DWORD WINAPI CycleThread(LPVOID)
-	{
-		_MESSAGE("pose test: waiting - WALK a few steps (about 1 m or more) and then STAND STILL for 3 s. It never starts during a loading screen.");
-
-		const DWORD t0 = GetTickCount();
-		float last[3] = { 0, 0, 0 };
-		bool haveLast = false, announced = false;
-		float walked = 0.0f;
-		DWORD stillSince = GetTickCount();
-
-		for(;;)
-		{
-			Sleep(100);
-			if(GetTickCount() - t0 > 600000) { _MESSAGE("pose test: no walking detected for 10 min - giving up"); return 0; }
-
-			float p[3];
-			if(!PlayerPos(p)) continue;
-			if(!haveLast) { memcpy(last, p, 12); haveLast = true; stillSince = GetTickCount(); continue; }
-
-			const float step = sqrtf((p[0] - last[0]) * (p[0] - last[0]) + (p[1] - last[1]) * (p[1] - last[1]));
-			if(step > 0.5f && step < 60.0f) walked += step;
-			if(step > 1.0f) stillSince = GetTickCount();
-			memcpy(last, p, 12);
-
-			if(walked > 80.0f && !announced) { announced = true; _MESSAGE("pose test: walking detected - gameplay is live. Now stand still."); }
-			if(announced && GetTickCount() - stillSince > 3000) break;
-		}
-
-		// 1) auto-verificacao da matematica (nao altera nada)
-		g_fkCheckDone = 0;
-		InterlockedExchange(&g_fkCheckRequested, 1);
-		for(int w = 0; w < 100 && !g_fkCheckDone; ++w) Sleep(100);
-		if(g_fkCheckDone)
-		{
-			_MESSAGE("pose test: self-check A (rebuilding the game's own world from effective locals): max error %.4f units, %.3f deg  -> maths OK if ~0",
-					 (double)g_fkRecT, (double)g_fkRecRot);
-			char idx[200] = ""; int n = 0;
-			for(unsigned k = 0; k < g_fkBadCount && n >= 0; ++k) n += _snprintf_s(idx + n, sizeof(idx) - n, _TRUNCATE, " %u", g_fkBadIdx[k]);
-			_MESSAGE("pose test: self-check B (hierarchy from direct local transforms): %u of %u entries differ from the game's world (max %.1f units, %.1f deg). First ones:%s",
-					 g_fkMismatch, g_fkEntries, (double)g_fkMaxT, (double)g_fkMaxRotDeg, idx);
-		}
-		else
-			_MESSAGE("pose test: self-check did not run (no pass seen)");
-
-		// 2) o repouso autoral (referencia do deslocamento do centro do corpo)
-		g_restReady = FC_GetPose(0, g_rest) ? 1 : 0;
-		if(!g_restReady) { _MESSAGE("pose test: could not read the authored rest pose - stopping"); return 0; }
-
-		// 3) movimentos reais, um de cada vez, na velocidade real: 4 s de pausa entre eles
-		struct Item { int id; const char * name; };
-		const Item items[] = { { 42, "contextMantle (climb over a ledge)" }, { 2, "up (climb a wall)" }, { 11, "hopUp" },
-							   { 27, "kickUp" }, { 30, "flipUp (flip)" }, { 8, "reach" } };
-		_MESSAGE("pose test: %d real FreeClimb motions will play one at a time, at real speed, 4 s apart. Watch the character from third person.",
-				 (int)(sizeof(items) / sizeof(items[0])));
-
-		for(size_t k = 0; k < sizeof(items) / sizeof(items[0]); ++k)
-		{
-			const float secs = FC_MotionSeconds(items[k].id);
-			if(secs <= 0.0f) { _MESSAGE("pose test: motion %d '%s' not available - skipped", items[k].id, items[k].name); continue; }
-
-			g_playMotion = items[k].id; g_playSeconds = secs; g_playFrames = 0; g_playStart = GetTickCount();
-			InterlockedExchange(&g_playing, 1);
-			_MESSAGE("pose test: PLAYING '%s' (%.2f s)", items[k].name, (double)secs);
-			Sleep((DWORD)(secs * 1000.0f) + 400);
-			InterlockedExchange(&g_playing, 0);
-			_MESSAGE("pose test: finished '%s' - %ld frames written", items[k].name, g_playFrames);
-			Sleep(4000);
-		}
-		_MESSAGE("pose test: all motions done");
-		return 0;
-	}
+void SceneHooksConfigure(int poseMode, float entryBlend, float exitBlend)
+{
+	g_poseMode = (poseMode == 0) ? 0 : 1;
+	g_entryBlend = entryBlend < 0.0f ? 0.0f : (entryBlend > 1.0f ? 1.0f : entryBlend);
+	g_exitBlend = exitBlend < 0.0f ? 0.0f : (exitBlend > 1.5f ? 1.5f : exitBlend);
 }
 
 void SceneHooksBindBones(const int * entryIndex)
 {
+	for(int spin = 0; spin < 200 && InterlockedCompareExchange(&g_inPose, 1, 0) != 0; ++spin) Sleep(1);
 	unsigned bound = 0;
 	for(int b = 0; b < 99; ++b)
 	{
 		g_boneEntry[b] = entryIndex[b];
 		if(entryIndex[b] >= 0) ++bound;
 	}
+	FillBoneNodes(g_playerFlat);
+	InterlockedExchange(&g_inPose, 0);
+
 	g_restReady = FC_GetPose(0, g_rest) ? 1 : 0;
-	_MESSAGE("pose engine: %u of 99 canonical bones are bound to flat-table entries; authored rest pose %s", bound, g_restReady ? "loaded" : "NOT available");
+	unsigned withNode = 0;
+	for(int b = 0; b < 99; ++b) if(g_boneEntry[b] >= 0 && g_boneNode[b]) ++withNode;
+	_MESSAGE("pose engine: %u of 99 canonical bones are bound to flat-table entries (%u of them have a scene node); authored rest pose %s",
+			 bound, withNode, g_restReady ? "loaded" : "NOT available");
 }
 
-void SceneHooksStartPoseTest()
+void SceneHooksSetPose(bool active, const float * pose990, int key, float blendSeconds)
 {
-	static bool started = false;
-	if(started) return;
-	started = true;
-
-	if(FC_PoseCount() == 0) { _MESSAGE("pose test: the animation library is not loaded - not started"); return; }
-
-	HANDLE t = CreateThread(NULL, 0, CycleThread, NULL, 0, NULL);
-	if(t) CloseHandle(t);
-}
-
-bool SceneHooksPlayMotion(int motion, float scaleY, float scaleZ, SceneFinishCallback onFinish)
-{
-	if(g_playing || !g_restReady || !g_playerFlat) return false;
-
-	bool bound = false;
-	for(int b = 0; b < 99; ++b) if(g_boneEntry[b] >= 0) bound = true;
-	if(!bound) return false;
-
-	const float secs = FC_MotionSeconds(motion);
-	if(secs <= 0.0f) return false;
-
-	g_playMotion = motion; g_playSeconds = secs; g_scaleY = scaleY; g_scaleZ = scaleZ; g_finishCb = onFinish;
-	g_playFrames = 0; g_playStart = GetTickCount();
-	InterlockedExchange(&g_playing, 1);
-	return true;
+	if(active && pose990)
+	{
+		memcpy(g_reqPose, pose990, sizeof(g_reqPose));
+		g_reqKey = key;
+		g_reqBlend = blendSeconds;
+	}
+	InterlockedExchange(&g_reqActive, (active && pose990) ? 1 : 0);
 }
 
 bool SceneHooksIsPlaying()
 {
-	return g_playing != 0;
+	return g_frameActive != 0;
 }
+
+bool SceneHooksPoseFaulted()
+{
+	return InterlockedExchange(&g_fault, 0) != 0;
+}
+
+void SceneHooksStartPoseTest() {}
 
 bool SceneHooksRootForward(float * x, float * y)
 {
@@ -602,15 +732,6 @@ bool SceneHooksRootForward(float * x, float * y)
 void SceneHooksSetTick(SceneTickCallback cb)
 {
 	g_tickCb = cb;
-}
-
-void SceneHooksSetManualPose(bool active, int motion, float phase, float scaleY, float scaleZ)
-{
-	g_manualMotion = motion;
-	g_manualPhase = phase;
-	g_scaleY = scaleY;
-	g_scaleZ = scaleZ;
-	InterlockedExchange(&g_manual, active ? 1 : 0);
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -657,11 +778,16 @@ bool SceneHooksRefreshTarget()
 	unsigned entries, n;
 	if(!FlatArray(flat, &entries, &n)) return false;
 
-	if(root == g_playerRoot && flat == g_playerFlat) return true;	// nada mudou
+	if(root == g_playerRoot && flat == g_playerFlat)
+	{
+		// nada mudou na raiz; mas confirma que as ligacoes continuam a bater certo com as entradas
+		if(BindingStillValid(entries, n)) return true;
+		_MESSAGE("pose engine: the flat table entries changed under the same skeleton - binding again");
+	}
 
-	// ligar os ossos canonicos as entradas, pelo nome (sem distinguir maiusculas)
+	// liga os ossos canonicos as entradas, pelo nome (sem distinguir maiusculas)
 	int map[99];
-	const int engineOwned[] = { 0, 1, 2, 3, 42, 43, 60, 61, 62, 63, 64, 65, 66, 97, 98 };
+	const int engineOwned[] = { 0, 1, 2, 3, 33, 34, 42, 43, 60, 61, 62, 63, 64, 65, 66, 97, 98 };
 	for(int bone = 0; bone < 99; ++bone)
 	{
 		map[bone] = -1;
@@ -686,6 +812,8 @@ bool SceneHooksRefreshTarget()
 	for(int bone = 0; bone < 99; ++bone) { g_boneEntry[bone] = map[bone]; if(map[bone] >= 0) ++bound; }
 	g_playerRoot = root;
 	g_playerFlat = flat;
+	FillBoneNodes(flat);
+	InterlockedExchange(&g_fault, 0);
 	InterlockedExchange(&g_inPose, 0);
 
 	_MESSAGE("pose engine: skeleton target refreshed - root %08X, flat table %08X (%u entries), %u of 99 bones bound", root, flat, n, bound);

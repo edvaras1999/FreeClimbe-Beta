@@ -1,11 +1,14 @@
 #pragma once
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include "TopCandidateSearch.h"
 #include "SearchRetry.h"
+#include "TraversalQueryBudget.h"
 #include "ThreepeatMotion.h"
 
 namespace fc {
@@ -22,13 +25,62 @@ struct Vec {
     bool finite() const { return std::isfinite(x)&&std::isfinite(y)&&std::isfinite(z); }
 };
 struct Hit { Vec point, normal; bool climbable{}; };
+struct AuthoredTrajectory {
+    struct Knot {float phase{};Vec displacement{};};
+    std::array<Knot,65> knots{};
+    std::uint32_t count{};
+    bool valid() const {
+        if(!count)return true;if(count<2||count>knots.size())return false;
+        if(knots[0].phase!=0||knots[count-1].phase!=1||knots[0].displacement.length()>=.001f)return false;
+        float distance=0;
+        for(std::uint32_t i=0;i<count;++i) {
+            const auto& knot=knots[i];const auto value=knot.displacement;
+            if(!std::isfinite(knot.phase)||knot.phase<0||knot.phase>1||!value.finite()||
+                std::abs(value.x)>500||std::abs(value.y)>500||std::abs(value.z)>500)return false;
+            if(i) {
+                if(knot.phase-knots[i-1].phase<.0001f)return false;
+                distance+=(value-knots[i-1].displacement).length();
+            }
+        }
+        return distance<=2000;
+    }
+    Vec sample(float phase) const {
+        if(count<2||count>knots.size())return {};
+        phase=std::clamp(phase,0.f,1.f);
+        std::uint32_t index=0;while(index+2<count&&knots[index+1].phase<phase)++index;
+        const auto& a=knots[index];const auto& b=knots[index+1];
+        return a.displacement+(b.displacement-a.displacement)*((phase-a.phase)/(b.phase-a.phase));
+    }
+    float nextPhase(float phase,float limit) const {
+        for(std::uint32_t i=1;i<std::min(count,std::uint32_t(knots.size()));++i)if(knots[i].phase>phase&&knots[i].phase<limit)return knots[i].phase;
+        return limit;
+    }
+};
+struct AuthoredMotion {
+    bool enabled{};
+    float seconds{},stride{};
+    AuthoredTrajectory trajectory;
+    std::array<std::array<float,2>,65> contacts{};
+};
+struct AuthoredWallRunSequences {
+    std::array<AuthoredMotion,5> launches,catches,braces;
+    std::array<bool,5> valid{};
+};
+struct ContextHopReference {
+    AuthoredMotion preparation,recovery;
+    float height{},halfWidth{},forward{};
+    std::array<Vec,2> toes{};
+    bool valid{};
+};
 enum class Motion : int;
 struct World {
     virtual ~World()=default;
     virtual std::optional<Hit> ray(Vec from,Vec to)=0;
 
     virtual bool actionBodyClear(Motion,Vec,Vec,float,float,Vec) {return false;}
+    virtual bool actionBodyPathClear(Motion m,Vec a,Vec b,float p,float q,Vec n,Vec) {return actionBodyClear(m,a,b,p,q,n);}
 };
+using AuthoredQueryWorld=TraversalQueryBudget<World,Vec,Hit,Motion>;
 struct Settings {
     float reach=110, gap=30, radius=22, height=125, chest=70, grip=112;
     float climbSpeed=100, sideSpeed=82, downSpeed=64, maxNormalZ=0.70f;
@@ -43,7 +95,7 @@ struct Settings {
     bool automaticClimbActions=false;
     bool legacyAutomaticHops=false;
     bool surfaceActionVariants=false;
-    bool wallRunObstacleJumps=false;
+    bool wallRunEnabled=true,wallRunObstacleJumps=false;
     float autoActionMinSeconds=2.f,autoActionMaxSeconds=3.5f;
     float contextScale=1;
 
@@ -53,6 +105,12 @@ struct Settings {
     std::array<float,2> threepeatHopDistance{},threepeatHopSeconds{};
     float threepeatMantleHeight{},threepeatMantleSeconds{},threepeatMantlePalmHeight{},threepeatMantleHalfWidth{},threepeatMantleForward{};
     std::array<Vec,2> threepeatMantleReplant{};
+    bool authoredMantle{};
+    AuthoredTrajectory authoredMantleTrajectory;
+    std::array<std::array<float,2>,65> authoredMantleContacts{};
+    std::shared_ptr<const std::array<AuthoredMotion,42>> authoredMotions;
+    std::shared_ptr<const AuthoredWallRunSequences> authoredWallRunSequences;
+    std::shared_ptr<const std::array<ContextHopReference,2>> contextHopReferences;
 };
 
 inline std::optional<Vec> threepeatReplantContact(World& world,Vec initial,Vec outward,Vec offset,float scale) {
@@ -70,26 +128,29 @@ inline std::optional<Vec> threepeatReplantContact(World& world,Vec initial,Vec o
 enum class State { idle, approach, wall, ledge, mantle, action };
 enum class Motion : int { none=0, hang=1, up=2, down=3, left=4, right=5, mantle=6, step=7, reach=8,
     hopLeft=9, hopRight=10, hopUp=11, drop=15,
-    jumpCatch=16, sprintCatch=17, dropBack=18, ledgeCatch=19,
+    jumpCatch=16, dropBack=18, ledgeCatch=19,
     runUp=20, runLeft=21, runRight=22, runDiagonalLeft=23, runDiagonalRight=24,
-    runLaunch=25, runCatch=26, kickUp=27, kickLeft=28, kickRight=29, flipUp=30, flipLeft=31, flipRight=32, runLaunchLeft=34, runLaunchRight=35, sideBrace=36, backFlipOut=37,
+    runLaunch=25, runCatch=26, kickUp=27, kickLeft=28, kickRight=29, runLaunchLeft=34, runLaunchRight=35, sideBrace=36, backFlipOut=37,
     contextHang=39,contextHopLeft=40,contextHopRight=41,contextMantle=42 };
 
-inline constexpr int legacyMotionCount=38,motionCount=42,activeMotionCount=35;
+inline constexpr int legacyMotionCount=38,motionCount=42,activeMotionCount=31;
 inline constexpr bool isActiveMotion(Motion motion) {
     const int id=static_cast<int>(motion);
-    return id>=1&&id<=motionCount&&id!=6&&id!=7&&id!=12&&id!=13&&id!=14&&id!=33&&id!=38;
+    return id>=1&&id<=motionCount&&id!=6&&id!=7&&id!=12&&id!=13&&id!=14&&id!=17&&id!=30&&id!=31&&id!=32&&id!=33&&id!=38;
 }
 inline bool threepeatHop(Motion m) {return m==Motion::contextHopLeft||m==Motion::contextHopRight;}
 inline bool threepeatMotion(Motion m) {return m>=Motion::contextHang&&m<=Motion::contextMantle;}
+inline bool authoredMovingLoop(Motion m) {return (m>=Motion::up&&m<=Motion::right)||(m>=Motion::runUp&&m<=Motion::runDiagonalRight);}
+inline bool authoredIdleLoop(Motion m) {return m==Motion::hang||m==Motion::contextHang;}
 
 inline constexpr float capturedWallPalmOffset=7.f;
 inline bool runMotion(Motion m) {return m>=Motion::runUp&&m<=Motion::runDiagonalRight;}
-inline bool flipMotion(Motion m) {return m>=Motion::flipUp&&m<=Motion::flipRight;}
-inline bool hopMotion(Motion m) {return (m>=Motion::hopLeft&&m<=Motion::hopUp)||(m>=Motion::kickUp&&m<=Motion::flipRight)||threepeatHop(m);}
+inline int wallRunDirectionIndex(Motion m) {return runMotion(m)?int(m)-int(Motion::runUp):-1;}
+inline bool wallRunLaunch(Motion m) {return m==Motion::runLaunch||m==Motion::runLaunchLeft||m==Motion::runLaunchRight;}
+inline bool hopMotion(Motion m) {return (m>=Motion::hopLeft&&m<=Motion::hopUp)||(m>=Motion::kickUp&&m<=Motion::kickRight)||threepeatHop(m);}
 #include "EdgePlan.h"
 
-inline constexpr float jumpActionSeconds(bool running,bool fancy=false) {return fancy?.72f:running?.44f:.52f;}
+inline constexpr float jumpActionSeconds(bool running) {return running?.44f:.52f;}
 inline constexpr float wallRunObstacleSeconds=.40f;
 inline float wallRunObstacleDuration(float distance,float speed,float outward) {
 
@@ -112,12 +173,8 @@ inline Vec backFlipExitPoint(Vec start,Vec outward,float phase) {
     return start+outward*outwardTravel+Vec{0,0,lift};
 }
 
-inline float actionFlightPhase(float p) {return std::clamp((p-.14f)/.66f,0.f,1.f);}
 inline float actionPushPhase(float p) {return std::clamp(p/.20f,0.f,1.f)*.25f;}
-inline float actionReturnPhase(Motion m,float p) {
-    const float start=flipMotion(m)?.80f:.60f;
-    return std::clamp((p-start)/(1-start),0.f,1.f);
-}
+inline float actionReturnPhase(float p) {const float start=.60f;return std::clamp((p-start)/(1-start),0.f,1.f);}
 
 enum class AttachFailure { none, unavailable, stamina, noWall, surface, support, tooFar, clearance };
 inline const char* name(AttachFailure reason) {
@@ -149,10 +206,84 @@ public:
     mutable Vec blockedFrom{},blockedTo{};
     const char* blockedReason="none";
     mutable const char* ledgeReason="not checked";
+    mutable bool authoredQueryBudgetExhausted{};
     bool wallRunning() const {return running;}
+    bool geometryHolding() const {return geometryHeld;}
+    bool geometryRetryDue(float dt) const {return geometryHeld&&std::isfinite(dt)&&dt>0&&dt>=geometryRetry;}
+    bool recoveringSupport() const {return supportRecoveryAction;}
+    bool resting() const {return staminaResting;}
     Vec direction() const {return moveDirection;}
     bool active() const { return state!=State::idle; }
-    void stop() { topSearchRetry.reset();hopSearchRetry.reset();state=State::idle; cooldown=0.6f;cornerActive=false;edgePreparation.active=false;automaticPreparation=false;resetAutomaticClock(); }
+    Motion wallRunDirection(Motion m) const {return runMotion(m)?m:!entryPose&&m==actionMotion&&(wallRunLaunch(m)||m==Motion::runCatch||m==Motion::sideBrace)?actionWallRunDirection:Motion::none;}
+    Motion contextHopDirection() const {return edgePreparation.active&&threepeatHop(edgePreparation.motion)?edgePreparation.motion:threepeatHop(actionMotion)?actionMotion:Motion::none;}
+    Motion poseDirection(Motion m) const {return m==Motion::contextHang?contextHopDirection():wallRunDirection(m);}
+    const ContextHopReference* contextHopReference(Motion direction=Motion::none) const {
+        if(direction==Motion::none)direction=contextHopDirection();
+        if(!threepeatHop(direction)||!cfg.contextHopReferences)return nullptr;
+        const auto& reference=(*cfg.contextHopReferences)[direction==Motion::contextHopLeft?0:1];
+        return reference.valid?&reference:nullptr;
+    }
+    float contextHangHeight(Motion direction=Motion::none) const {const auto* r=contextHopReference(direction);return r?r->height:cfg.threepeatHangHeight;}
+    float contextHangHalfWidth(Motion direction=Motion::none) const {const auto* r=contextHopReference(direction);return r?r->halfWidth:cfg.threepeatHandHalfWidth;}
+    float contextHangForward() const {const auto* r=contextHopReference();return r?r->forward:cfg.threepeatHangForward;}
+    const std::array<Vec,2>& contextHangToes() const {const auto* r=contextHopReference();return r?r->toes:cfg.threepeatHangToes;}
+    float contextHangPhase() const {
+        const auto* reference=contextHopReference();if(!reference)return 0;
+        return std::clamp(edgeSettled?(.18f-actionCooldown)/std::max(.001f,reference->recovery.seconds):
+            edgePreparation.settle/std::max(.001f,reference->preparation.seconds),0.f,1.f);
+    }
+    bool authored(Motion m,Motion direction=Motion::none) const {return authoredMotion(m,direction).enabled;}
+    const AuthoredMotion& authoredMotion(Motion m,Motion direction=Motion::none) const {
+        static const AuthoredMotion empty{};
+        if(!isActiveMotion(m))return empty;
+        if(m==Motion::contextHang)if(const auto* reference=contextHopReference(direction))return edgeSettled?reference->recovery:reference->preparation;
+        const int index=wallRunDirectionIndex(direction==Motion::none?wallRunDirection(m):direction);
+        if(index>=0&&cfg.authoredWallRunSequences&&cfg.authoredWallRunSequences->valid[index]) {
+            if(wallRunLaunch(m))return cfg.authoredWallRunSequences->launches[index];
+            if(m==Motion::runCatch)return cfg.authoredWallRunSequences->catches[index];
+            if(m==Motion::sideBrace&&cfg.authoredWallRunSequences->braces[index].seconds>0)return cfg.authoredWallRunSequences->braces[index];
+        }
+        return cfg.authoredMotions?(*cfg.authoredMotions)[std::size_t(int(m)-1)]:empty;
+    }
+    float motionDuration(Motion m,float fallback) const {return authored(m)?std::max(.001f,authoredMotion(m).seconds):fallback;}
+    bool authoredPath(Motion m,Motion direction=Motion::none) const {
+        if(!authored(m,direction)||authoredMovingLoop(m)||authoredIdleLoop(m))return false;
+        const auto& path=authoredMotion(m,direction).trajectory;
+        for(std::uint32_t i=0;i<std::min(path.count,std::uint32_t(path.knots.size()));++i)
+            if(path.knots[i].displacement.dot(path.knots[i].displacement)>=4.f)return true;
+        return false;
+    }
+    Vec authoredRoot(Motion m,float phase) const {
+        if(!authored(m)||authoredIdleLoop(m))return {};
+        const auto& path=authoredMotion(m).trajectory;const auto end=path.sample(1);
+        if(authoredMovingLoop(m))return end.length()>=2.f?end*std::clamp(phase,0.f,1.f):Vec{};
+        return authoredPath(m)?path.sample(phase):Vec{};
+    }
+    float authoredPathProgress(Motion m,float phase) const {
+        const auto& path=authoredMotion(m).trajectory;const auto end=path.sample(1);
+        return end.dot(end)>=4.f?path.sample(phase).dot(end)/end.dot(end):ease(std::clamp(phase,0.f,1.f));
+    }
+    float motionHandWeight(Motion m,int hand,float phase) const {
+        const auto& samples=authoredMotion(m).contacts;const float at=std::clamp(phase,0.f,1.f)*64;
+        const auto index=std::min(std::size_t(at),std::size_t(63));
+        return samples[index][hand]+(samples[index+1][hand]-samples[index][hand])*(at-float(index));
+    }
+    Vec authoredMotionPoint(Motion m,Vec from,Vec to,Vec outward,float phase) const {
+        const auto& path=authoredMotion(m).trajectory;const auto end=path.sample(1);
+        const float clamped=std::clamp(phase,0.f,1.f);const auto sample=path.sample(clamped);
+        const float along=authoredPathProgress(m,clamped);
+        const Vec residual=sample-end*along,right{-outward.y,outward.x,0};
+        Vec result=from+(to-from)*along+(right*residual.x-outward*residual.y+Vec{0,0,residual.z})*std::clamp(cfg.contextScale,.5f,2.f);
+        if(phase>1) {
+            const float step=.002f;
+            const auto before=authoredMotionPoint(m,from,to,outward,1-step);
+            result=result+(result-before)*((phase-1)/step);
+        }
+        return result;
+    }
+    float authoredPhase(Motion m) const {return entryPose&&m==entryMotion?approachTime:m==Motion::contextMantle?std::max(0.f,mantleTime):actionTime;}
+    Vec actionPathPoint(float phase) const {return actionPoint(phase);}
+    void stop() { geometryHeld=staminaResting=supportRecoveryAction=false;geometryRetry=supportRecoveryRetry=0;supportRecoveryCursor=0;topSearchRetry.reset();hopSearchRetry.reset();state=State::idle; cooldown=0.6f;cornerActive=false;edgePreparation.active=false;automaticPreparation=false;resetAutomaticClock(); }
     void reset() { stop(); cooldown=0;mantleSelectionStatus=0; }
     void tickCooldown(float dt) { cooldown=std::max(0.0f,cooldown-std::clamp(dt,0.0f,0.05f)); }
     float progress() const { return state==State::approach ? approachTime : state==State::action ? actionTime : std::max(0.f,mantleTime); }
@@ -162,6 +293,7 @@ public:
         return !threepeatMantle&&(mantleLip.z-mantleFrom.z)<=70.f*std::clamp(cfg.contextScale,.5f,2.f);
     }
     float topSampleBegin() const {
+        if(cfg.authoredMantle)return 0.f;
         if(threepeatMantle)return 0.f;
         if(lowTopStep())return std::max(.72f,std::max(cfg.threepeatProfile.mantleRelease[0][1],cfg.threepeatProfile.mantleRelease[1][1]));
         const float scale=std::clamp(cfg.contextScale,.5f,2.f);
@@ -170,11 +302,15 @@ public:
         return height<palmHeight-24.f?std::max(cfg.threepeatProfile.mantleRelease[0][1],cfg.threepeatProfile.mantleRelease[1][1]):0.f;
     }
     float topSamplePhase(float phase) const {const float begin=topSampleBegin();return begin+(1-begin)*std::max(0.f,phase);}
-    float topSeconds() const {return std::max(lowTopStep()?.50f:.25f,cfg.threepeatMantleSeconds>0?cfg.threepeatMantleSeconds*(1-topSampleBegin()):cfg.mantleSeconds);}
-    float topPreparation() const {if(lowTopStep())return 1.f;return std::clamp(1.f+mantleTime*topSeconds()/.60f,0.f,1.f);}
-    bool topReplanted(float phase) const {return threepeatMantle&&phase>=cfg.threepeatProfile.mantleReplant[0];}
+    float topSeconds() const {if(cfg.authoredMantle)return std::max(.001f,cfg.threepeatMantleSeconds);return std::max(lowTopStep()?.50f:.25f,cfg.threepeatMantleSeconds>0?cfg.threepeatMantleSeconds*(1-topSampleBegin()):cfg.mantleSeconds);}
+    float topPreparation() const {if(cfg.authoredMantle||lowTopStep())return 1.f;return std::clamp(1.f+mantleTime*topSeconds()/.60f,0.f,1.f);}
+    bool topReplanted(float phase) const {return !cfg.authoredMantle&&threepeatMantle&&phase>=cfg.threepeatProfile.mantleReplant[0];}
     Vec topReplantOffset(int hand) const {return cfg.threepeatMantleReplant[hand];}
-    float topHandWeight(int hand,float phase) const {return threepeatMantleWeight(hand,phase,cfg.threepeatProfile);}
+    float topHandWeight(int hand,float phase) const {
+        if(!cfg.authoredMantle)return threepeatMantleWeight(hand,phase,cfg.threepeatProfile);
+        const float at=std::clamp(phase,0.f,1.f)*64;const auto index=std::min(std::size_t(at),std::size_t(63));
+        return cfg.authoredMantleContacts[index][hand]+(cfg.authoredMantleContacts[index+1][hand]-cfg.authoredMantleContacts[index][hand])*(at-float(index));
+    }
     float topRiseProgress(float phase) const {return topSampleBegin()>.5f?1.f:ease((phase-.04f)/.88f);}
     float topForwardProgress(float phase) const {return topSampleBegin()>.5f?1.f:ease((phase-.32f)/.60f);}
     float topClearanceProgress(float phase) const {return ease((phase-.45f)/.15f);}
@@ -187,8 +323,46 @@ public:
         return distance*hopAlongPhase(actionTime)+(actionTime>=1?(position-actionTo).dot(route.unit()):0.f);
     }
     float stalledSeconds() const { return stalled; }
-    void entry(Motion m,bool jump=false) { if(!isActiveMotion(m))return;entryMotion=m; jumpEntry=jump||approachLift>0; }
+    void entry(Motion m,bool jump=false) {
+        if(!isActiveMotion(m))return;
+        if(m!=entryMotion)entrySeconds=approachLift>0?std::max(cfg.approachSeconds,.28f+approachLift/260.f):cfg.approachSeconds;
+        entryMotion=m;entryPose=true;jumpEntry=jump||approachLift>0;entrySeconds=motionDuration(m,entrySeconds);
+    }
+    bool sameAuthoredEntryPath(const Traversal& checked) const {
+        auto same=[](Vec a,Vec b){return a.x==b.x&&a.y==b.y&&a.z==b.z;};
+        if(!authoredPath(entryMotion)||!checked.authoredPath(checked.entryMotion)||entryMotion!=checked.entryMotion||
+            !entryPose||!checked.entryPose||approachTime!=0||checked.approachTime!=0||state!=checked.state||
+            !same(position,checked.position)||!same(normal,checked.normal)||!same(surfaceNormal,checked.surfaceNormal)||
+            !same(approachFrom,checked.approachFrom)||!same(approachTo,checked.approachTo)||
+            jumpEntry!=checked.jumpEntry||approachLift!=checked.approachLift||approachRounded!=checked.approachRounded||
+            entrySeconds!=checked.entrySeconds||cfg.radius!=checked.cfg.radius||cfg.height!=checked.cfg.height||
+            cfg.chest!=checked.cfg.chest||cfg.gap!=checked.cfg.gap||cfg.contextScale!=checked.cfg.contextScale)return false;
+        const auto& a=authoredMotion(entryMotion).trajectory;const auto& b=checked.authoredMotion(entryMotion).trajectory;
+        if(a.count!=b.count||!a.valid()||!b.valid())return false;
+        for(std::uint32_t i=0;i<a.count;++i)
+            if(a.knots[i].phase!=b.knots[i].phase||!same(a.knots[i].displacement,b.knots[i].displacement))return false;
+        return true;
+    }
+    bool entry(World& w,Motion m,bool jump=false,const Traversal* checked=nullptr) {
+        const bool changed=m!=entryMotion;
+        entry(m,jump);
+        if(!authored(m))return !changed||entryPathClear(w,approachFrom,approachTo,jumpEntry,0,1,approachFrom,approachLift,approachRounded);
+        const bool prechecked=checked&&checked!=this&&checked->lastFailure==AttachFailure::none&&sameAuthoredEntryPath(*checked);
+        Vec previous=approachFrom;float phase=0;
+        while(!prechecked&&phase<1) {
+            phase=authoredMotion(m).trajectory.nextPhase(phase,std::min(1.f,phase+1.f/32));
+            const auto point=entryPathPoint(phase);
+            if(!clearPath(w,previous,point,approachRounded))return false;
+            previous=point;
+        }
+        if(state==State::wall){state=State::approach;position=approachFrom;approachTime=0;}
+        return true;
+    }
+    Vec entryPathPoint(float phase) const {
+        return authoredPath(entryMotion)?authoredMotionPoint(entryMotion,approachFrom,approachTo,normal,phase):entryPoint(approachFrom,approachTo,phase,jumpEntry,approachLift);
+    }
     float reachProgress() const { return approachTime; }
+    Motion entrySelection() const {return entryMotion;}
     float entryLiftHeight() const {return approachLift;}
     float entryDuration() const {return entrySeconds;}
     bool roundedEntryPath() const {return approachRounded;}
@@ -198,7 +372,12 @@ public:
     Vec topLip() const { return mantleLip; }
     Vec topStart() const { return mantleFrom; }
     bool roundedTopPath() const {return roundedMantle;}
-    Vec topPathPoint(float phase) const {if(lowTopStep())phase=.22f+.78f*std::clamp(phase,0.f,1.f);return roundedMantle?roundedMantlePoint(phase,mantleFrom,mantleApex,mantleTo):rawMantlePoint(phase,mantleFrom,mantleApex,mantleTo);}
+    const char* topRouteKind() const {return !cfg.authoredMantle?"calibrated":mantleRoute.count?"corridor":"source";}
+    Vec topPathPoint(float phase) const {
+        if(cfg.authoredMantle&&authoredPath(Motion::contextMantle))return authoredMantlePoint(phase,mantleFrom,mantleTo);
+        if(!cfg.authoredMantle&&lowTopStep())phase=.22f+.78f*std::clamp(phase,0.f,1.f);
+        return roundedMantle?roundedMantlePoint(phase,mantleFrom,mantleApex,mantleTo):rawMantlePoint(phase,mantleFrom,mantleApex,mantleTo);
+    }
     Motion topMotion() const {return Motion::contextMantle;}
     Vec topHand(int hand) const {return mantleHands[hand];}
     Vec topHandNormal(int hand) const {return mantleHandNormals[hand];}
@@ -252,7 +431,7 @@ public:
     unsigned obstacleJumpCount() const {return obstacleJumps;}
     float automaticActionPendingSeconds() const {return automaticInterval>0?std::max(0.f,automaticInterval-automaticElapsed):cfg.autoActionMinSeconds;}
 
-    bool attach(World& w,Vec feet,Vec facing,float stamina,float maxSnap=1000,bool explicitAirCatch=false,bool groundJump=false) {
+    bool attach(World& world,Vec feet,Vec facing,float stamina,float maxSnap=1000,bool explicitAirCatch=false,bool groundJump=false,Motion selectedEntry=Motion::reach,Motion nearEntry=Motion::none,float nearEntryDistance=48) {
         lastFailure=AttachFailure::unavailable;
         lastAttachDistance=0;entryUsedTopFallback=false;entryTopRise=0;
 
@@ -260,6 +439,16 @@ public:
         if(cfg.staminaEnabled&&stamina<cfg.startStamina) { lastFailure=AttachFailure::stamina; return false; }
         facing.z=0; facing=facing.unit();
         if(facing.length()<0.9f) return false;
+        struct EntryBudget final:World {
+            World& source;unsigned count{};bool exhausted{};
+            explicit EntryBudget(World& value):source(value){}
+            std::optional<Hit> ray(Vec from,Vec to) override {
+                if(count>=12288){exhausted=true;return Hit{from,(from-to).unit(),false};}
+                ++count;return source.ray(from,to);
+            }
+        } sourceBudget(world);
+        World& w=authoredPath(selectedEntry)||authoredPath(nearEntry)?static_cast<World&>(sourceBudget):world;
+        Motion acceptedEntry=selectedEntry;
         Vec target{};bool found=false;float selectedLift=0;bool selectedRounded=false;std::optional<float> selectedTopRise;
         AttachFailure bestFailure=AttachFailure::noWall;float rejectedDistance=0;bool rejectedCandidate=false;
         auto candidateFailure=[&](AttachFailure failure,float distance) {
@@ -292,7 +481,17 @@ public:
                 const Vec candidate=offsetFromSurface(candidateFeet,*h);
                 const float distance=(candidate-origin).length();
                 if(distance>maxSnap){candidateFailure(AttachFailure::tooFar,distance);continue;}
-                if(!clearPath(entryGeometry,origin,candidate,rounded)){candidateFailure(AttachFailure::clearance,distance);continue;}
+                const Motion candidateEntry=isActiveMotion(nearEntry)&&std::isfinite(nearEntryDistance)&&nearEntryDistance>=0&&
+                    (candidate-feet).length()<=nearEntryDistance?nearEntry:selectedEntry;
+                if(authoredPath(candidateEntry)) {
+                    Vec previous=feet;float phase=0;bool clear=true;
+                    while(phase<1) {
+                        phase=authoredMotion(candidateEntry).trajectory.nextPhase(phase,std::min(1.f,phase+1.f/32));
+                        const auto point=authoredMotionPoint(candidateEntry,feet,candidate,normal,phase);
+                        if(!clearPath(entryGeometry,previous,point,rounded)){clear=false;break;}previous=point;
+                    }
+                    if(!clear){candidateFailure(AttachFailure::clearance,distance);continue;}
+                } else if(!clearPath(entryGeometry,origin,candidate,rounded)){candidateFailure(AttachFailure::clearance,distance);continue;}
 
                 if(rounded&&(!clearPath(entryGeometry,candidate,candidate)||!entrySideClear(entryGeometry,candidate))) {
                     candidateFailure(AttachFailure::clearance,distance);continue;
@@ -307,11 +506,11 @@ public:
                     fallbackTopRise=lowTop->lip.z-feet.z;
                 }
 
-                if(jump&&cfg.approachSeconds>0&&
+                if(!authoredPath(candidateEntry)&&jump&&cfg.approachSeconds>0&&
                     !entryPathClear(entryGeometry,origin,candidate,true,0,1,origin,0,rounded)) {
                     candidateFailure(AttachFailure::clearance,distance);continue;
                 }
-                lastAttachDistance=distance;selectedTopRise=fallbackTopRise;return candidate;
+                lastAttachDistance=distance;selectedTopRise=fallbackTopRise;acceptedEntry=candidateEntry;return candidate;
             }
         }
         return {};
@@ -336,23 +535,27 @@ public:
                 if(limited.exhausted||lift>std::clamp(cfg.groundJumpHeight,0.f,88.f))break;
                 const auto raised=findEntry(feet+Vec{0,0,lift},true,false,true);
                 if(!raised)continue;
-                if(!entryPathClear(limited,feet,*raised,true,0,1,feet,lift,true)||limited.exhausted) {
+                if((!authoredPath(acceptedEntry)&&!entryPathClear(limited,feet,*raised,true,0,1,feet,lift,true))||limited.exhausted) {
                     candidateFailure(AttachFailure::clearance,lastAttachDistance);continue;
                 }
                 target=*raised;found=true;selectedRounded=true;selectedLift=lift;break;
             }
         }
+        if(sourceBudget.exhausted){lastFailure=AttachFailure::clearance;lastAttachDistance=rejectedDistance;return false;}
         if(!found){lastFailure=bestFailure;lastAttachDistance=rejectedDistance;return false;}
-        approachFrom=feet; approachTo=target; approachTime=0;
+        approachFrom=feet; approachTo=target; approachTime=0;entryPose=true;
         approachLift=selectedLift;approachRounded=selectedRounded;
         entryUsedTopFallback=selectedTopRise.has_value();entryTopRise=selectedTopRise.value_or(0.f);
         entrySeconds=selectedLift>0?std::max(cfg.approachSeconds,.28f+selectedLift/260.f):cfg.approachSeconds;
-        stalled=0;detourProbe=0;actionTime=0;actionCooldown=0;runBlend=diagonalRunBlend=0;entryMotion=Motion::reach;
+        stalled=0;detourProbe=0;actionTime=0;actionCooldown=0;runBlend=diagonalRunBlend=0;entryMotion=acceptedEntry;
+        entrySeconds=motionDuration(entryMotion,entrySeconds);
         roofTransfer=false;roofProbeCooldown=0;actionStartSurface=actionTargetSurface={};mantleCrest=threepeatMantle=false;
         edgeAction=edgeSettled=false;edgeProbeCooldown=0;actionSourceEdge=actionTargetEdge={};
         cornerActive=false;cornerProbeCooldown=0;cornerRoute={};edgePreparation={};threepeatPlanStatus=mantleSelectionStatus=0;
-        stableMotion=Motion::hang;clearanceMargin=0;missingSurface=0;runClearanceCooldown=0;running=false;jumpEntry=groundJump;moveDirection={};
-        roundedMantle=false;automaticPreparation=false;resetAutomaticClock();
+        stableMotion=Motion::hang;actionWallRunDirection=Motion::none;clearanceMargin=0;missingSurface=0;runClearanceCooldown=0;running=false;jumpEntry=groundJump;moveDirection={};
+        roundedMantle=false;mantleRoute={};automaticPreparation=false;resetAutomaticClock();
+        geometryHeld=staminaResting=false;geometryRetry=0;
+        supportRecoveryAction=false;supportRecoveryRetry=0;supportRecoveryCursor=0;supportRecoveryOrigin=position;supportRecoveryInput={};
         obstacleJump=false;obstacleProbeCooldown=0;actionRunSpeed=cfg.runSpeed;
         topSearchRetry.reset();hopSearchRetry.reset();
         position=cfg.approachSeconds>0 ? feet : target;
@@ -363,7 +566,32 @@ public:
     }
 
     Result update(World& w,Input in,float dt,float stamina) {
+        if(!cfg.authoredMotions&&!cfg.authoredWallRunSequences) {
+            auto result=updateWithStamina(w,in,dt,cfg.staminaEnabled?stamina:1000000.f);
+            if(!cfg.staminaEnabled)result.staminaCost=0;
+            return result;
+        }
+        const auto savedState=state;const auto savedPosition=position,savedNormal=normal,savedSurface=surfaceNormal;
+        const bool savedEdge=edgeAction,savedSettled=edgeSettled,savedCorner=cornerActive;
+        const auto savedSource=actionSourceEdge,savedTarget=actionTargetEdge;const auto savedPreparation=edgePreparation;
+        const bool savedRunning=running;const auto savedStable=stableMotion;const float savedRunBlend=runBlend,savedDiagonalBlend=diagonalRunBlend;
+        const auto savedWallRunDirection=actionWallRunDirection;
+        const auto savedAutomatic=automaticActions,savedSurfaceActions=surfaceActions,savedObstacles=obstacleJumps;
+        authoredActionRejected=false;authoredBackFlipPrechecked=false;authoredQueryBudgetExhausted=false;
         auto result=updateWithStamina(w,in,dt,cfg.staminaEnabled?stamina:1000000.f);
+        if(authoredActionRejected||(!geometryHeld&&!staminaResting&&state==State::action&&actionTime==0&&authored(actionMotion)&&!checkAuthoredAction(w))) {
+            position=savedState==State::action?actionFrom:savedPosition;normal=savedNormal;surfaceNormal=savedSurface;
+            state=savedState==State::action?State::wall:savedState;
+            edgeAction=savedEdge;edgeSettled=savedSettled;cornerActive=savedCorner;
+            actionSourceEdge=savedSource;actionTargetEdge=savedTarget;edgePreparation=savedPreparation;
+            running=savedRunning;stableMotion=savedStable;runBlend=savedRunBlend;diagonalRunBlend=savedDiagonalBlend;
+            actionWallRunDirection=savedWallRunDirection;
+            automaticActions=savedAutomatic;surfaceActions=savedSurfaceActions;obstacleJumps=savedObstacles;
+            obstacleJump=roofTransfer=detour=false;actionCooldown=.15f;
+            authoredActionChecked=authoredActionRejected=false;
+            result={};result.motion=isActiveMotion(savedStable)?savedStable:Motion::hang;
+            result.reason=authoredQueryBudgetExhausted?"authored action query budget exhausted":"authored action path blocked";blockedReason=result.reason;
+        }
         if(!cfg.staminaEnabled)result.staminaCost=0;
         return result;
     }
@@ -377,6 +605,7 @@ public:
             return out;
         }
         topSearchRetry.tick(dt);hopSearchRetry.tick(dt);
+        supportRecoveryRetry=std::max(0.f,supportRecoveryRetry-dt);
         actionCooldown=std::max(0.f,actionCooldown-dt);
         edgeProbeCooldown=std::max(0.f,edgeProbeCooldown-dt);
         cornerProbeCooldown=std::max(0.f,cornerProbeCooldown-dt);
@@ -385,13 +614,47 @@ public:
         blockedHit.reset();
         blockedReason="none";
         runClearanceCooldown=std::max(0.f,runClearanceCooldown-dt);
+        const bool wasResting=staminaResting;
+        if(in.release&&(state!=State::action||(actionMotion!=Motion::drop&&
+            (!in.backDrop||(actionMotion!=Motion::dropBack&&actionMotion!=Motion::backFlipOut))))) {
+            geometryHeld=staminaResting=false;geometryRetry=0;
+            Vec target=position;
+
+            const bool settled=state==State::wall||state==State::ledge;
+            const bool backFlip=in.backDrop&&settled&&cfg.fancyJumps&&checkedBackFlip(w);
+            if(in.backDrop&&!backFlip) {
+
+                const auto velocity=backJumpVelocity(w,normal*220.f+Vec{0,0,90});
+                const auto candidate=position+velocity*(.32f/3.f);
+                if(clearPath(w,position,candidate))target=candidate;
+            }
+            if(backFlip){beginAction(Motion::backFlipOut,position,backFlipExitPoint(position,normal,1),backFlipExitSeconds);authoredActionChecked=authoredBackFlipPrechecked;}
+            else beginAction(in.backDrop?Motion::dropBack:Motion::drop,position,target,in.backDrop?.32f:.16f);
+        }
+        const bool recoveringWall=geometryHeld&&(state==State::wall||state==State::ledge);
+        const bool departing=state==State::action&&(actionMotion==Motion::drop||actionMotion==Motion::dropBack||actionMotion==Motion::backFlipOut);
+        if(!departing) {
+            staminaResting=stamina<=0||(wasResting&&stamina<std::max(1.f,cfg.startStamina));
+            if(staminaResting) {
+                running=false;runBlend=diagonalRunBlend=0;moveDirection={};resetAutomaticClock();
+                edgePreparation.active=automaticPreparation=false;
+                out.motion=heldMotion();if(state==State::wall||state==State::ledge)stableMotion=Motion::hang;
+                out.reason=blockedReason="resting until stamina recovers";return out;
+            }
+            if(geometryHeld) {
+                geometryRetry=std::max(0.f,geometryRetry-dt);
+                if(geometryRetry>0)return heldResult("waiting for traversal geometry");
+                geometryHeld=false;
+            }
+        }
         if(edgeSettled&&(std::abs(in.x)+std::abs(in.y)>.1f||in.hop||in.release||
             !gripEdgeStillValid(w,actionTargetEdge)||
             ((threepeatHop(actionMotion)||actionMotion==Motion::contextHang)&&
                 (actionCooldown<=0||!idle39FeetSupported(w,position,actionTargetEdge)))))edgeAction=edgeSettled=false;
 
-        const bool wallRunControls=in.y>=0&&(in.run||running||runBlend>.5f||runMotion(stableMotion));
+        const bool wallRunControls=in.y>=0&&((cfg.wallRunEnabled&&in.run)||running||runBlend>.5f||runMotion(stableMotion));
         if(wallRunControls)in.hop=false;
+        if(!cfg.wallRunEnabled)in.run=false;
         running=in.run&&in.y>=0&&(std::abs(in.x)+std::abs(in.y)>.1f)&&runClearanceCooldown<=0;
         if(running&&!(state==State::action&&obstacleJump)&&!runwayClear(w,
             state==State::approach&&entryMotion==Motion::runLaunch?approachTo:position)) {
@@ -408,29 +671,54 @@ public:
         if(!automaticInputAllowed(in,wallRunControls)||
             (automaticDirection.length()>.1f&&automaticDirection.dot(Vec{in.x,in.y,0}.unit())<.45f))resetAutomaticClock();
         else automaticDirection=Vec{in.x,in.y,0}.unit();
-        if(stamina<=0) { stop(); out.released=true;out.reason="stamina exhausted"; return out; }
-        if(in.release&&(state!=State::action||(actionMotion!=Motion::drop&&
-            (!in.backDrop||(actionMotion!=Motion::dropBack&&actionMotion!=Motion::backFlipOut))))) {
-            Vec target=position;
-
-            const bool settled=state==State::wall||state==State::ledge;
-            const bool backFlip=in.backDrop&&settled&&cfg.fancyJumps&&checkedBackFlip(w);
-            if(in.backDrop&&!backFlip) {
-
-                const auto velocity=backJumpVelocity(w,normal*220.f+Vec{0,0,90});
-                const auto candidate=position+velocity*(.32f/3.f);
-                if(clearPath(w,position,candidate))target=candidate;
+        if(!recoveringWall&&(state==State::wall||state==State::ledge)&&!in.release&&!in.hop&&!edgePreparation.active&&!cornerActive&&actionCooldown<=0) {
+            const Motion wanted=running?(std::abs(in.x)<.1f?Motion::runUp:std::abs(in.y)<.1f?
+                (in.x<0?Motion::runLeft:Motion::runRight):(in.x<0?Motion::runDiagonalLeft:Motion::runDiagonalRight)):Motion::hang;
+            Motion bridge=Motion::none;
+            if(running&&!runMotion(stableMotion))bridge=std::abs(in.x)>.1f?(in.x<0?Motion::runLaunchLeft:Motion::runLaunchRight):Motion::runLaunch;
+            else if(!running&&runMotion(stableMotion))bridge=Motion::runCatch;
+            else if(running&&runMotion(stableMotion)&&wanted!=stableMotion&&
+                ((stableMotion==Motion::runLeft||stableMotion==Motion::runDiagonalLeft)&&(wanted==Motion::runRight||wanted==Motion::runDiagonalRight)||
+                 (stableMotion==Motion::runRight||stableMotion==Motion::runDiagonalRight)&&(wanted==Motion::runLeft||wanted==Motion::runDiagonalLeft)))bridge=Motion::sideBrace;
+            const Motion bridgeDirection=bridge==Motion::runCatch?stableMotion:wanted;
+            if(authored(bridge,bridgeDirection)) {
+                Vec destination=position;bool supported=true;
+                if(authoredPath(bridge,bridgeDirection)&&std::hypot(in.x,in.y)>.1f) {
+                    const Vec direction=(Vec{-normal.y,normal.x,0}*in.x+Vec{0,0,in.y}).unit();
+                    const auto proposed=position+direction*std::min(96.f,authoredMotion(bridge,bridgeDirection).trajectory.sample(1).length()*cfg.contextScale);
+                    const auto grip=support(w,proposed,normal*-1);
+                    supported=grip.has_value();
+                    if(grip)destination=offsetFromSurface(proposed,*grip);
+                }
+                if(supported) {
+                    beginAction(bridge,position,destination,.2f,bridgeDirection);stableMotion=wanted;
+                    out.motion=bridge;out.reason="authored wall-run transition";return out;
+                }
             }
-            if(backFlip)beginAction(Motion::backFlipOut,position,backFlipExitPoint(position,normal,1),backFlipExitSeconds);
-            else beginAction(in.backDrop?Motion::dropBack:Motion::drop,position,target,in.backDrop?.32f:.16f);
         }
 
 
         if(state==State::action) {
-
+            out.motion=actionMotion;
+            if(authored(actionMotion)&&!checkAuthoredAction(w)) {
+                if(departing) {
+                    stop();out.motion=Motion::drop;out.released=true;out.reason="manual release: authored exit path blocked";return out;
+                }
+                authoredActionRejected=true;out.motion=Motion::hang;out.reason="authored action path blocked";return out;
+            }
             const float rawNextTime=actionTime+dt/actionSeconds;
             const float nextTime=std::min(1.f,rawNextTime);
             Vec target=position,previous=position;float previousPhase=actionTime;
+            const auto landingSupport=nextTime>=1&&hopMotion(actionMotion)&&!supportRecoveryAction?
+                support(w,actionPoint(1),actionLandingNormal*-1):std::optional<Hit>{};
+            std::optional<Hit> recoverySupport;
+            if(supportRecoveryAction) {
+                recoverySupport=recoveryLanding(w,actionTo,actionTargetSurface);
+                if(!recoverySupport) {
+                    if(auto retried=retrySupportRecovery(w,in,stamina))return *retried;
+                    return holdGeometry("recovery destination support changed");
+                }
+            }
             if(obstacleJump||roofTransfer) {
                 const auto destination=support(w,actionTo,actionLandingNormal*-1);
                 const bool targetPresent=destination&&horizontal(destination->normal).dot(actionLandingNormal)>.95f&&
@@ -440,13 +728,11 @@ public:
                 const Vec sourceNormal=roofTransfer?horizontal(actionStartSurface):actionLandingNormal;
                 const auto source=actionTime<.12f?support(w,actionFrom,sourceNormal*-1):std::optional<Hit>{};
                 if(!targetPresent||(actionTime<.12f&&!source)) {
-                    out.motion=actionMotion;out.releaseVelocity={0,0,-80};
-                    out.reason=roofTransfer?"obstacle bypass support changed":"wall-run jump support changed";
-                    stop();out.released=true;return out;
+                    return holdGeometry(roofTransfer?"obstacle bypass support changed":"wall-run jump support changed");
                 }
             }
 
-            const bool sourceNeeded=threepeatHop(actionMotion)?std::max(threepeatSourceWeight(actionMotion==Motion::contextHopLeft,0,actionTime,cfg.threepeatProfile),
+            const bool sourceNeeded=authored(actionMotion)?std::max(motionHandWeight(actionMotion,0,actionTime),motionHandWeight(actionMotion,1,actionTime))>.05f:threepeatHop(actionMotion)?std::max(threepeatSourceWeight(actionMotion==Motion::contextHopLeft,0,actionTime,cfg.threepeatProfile),
                     threepeatSourceWeight(actionMotion==Motion::contextHopLeft,1,actionTime,cfg.threepeatProfile))>.05f:actionTime<.18f;
             const bool sourcePresent=!edgeAction||!sourceNeeded||gripEdgeStillValid(w,actionSourceEdge);
             if(edgeAction&&(!sourcePresent||!gripEdgeStillValid(w,actionTargetEdge))) {
@@ -454,78 +740,96 @@ public:
                     state=State::wall;edgeAction=false;actionCooldown=.3f;
                     out.motion=stableMotion=Motion::hang;out.reason="planned edge changed before release";
                 } else {
-                    out.motion=actionMotion;out.releaseVelocity={0,0,-80};
-                    stop();edgeAction=false;out.released=true;out.reason="planned edge disappeared";
+                    return holdGeometry("planned edge disappeared");
                 }
                 return out;
             }
-            const int divisions=actionMotion==Motion::backFlipOut?backFlipExitSegments:
-                hopMotion(actionMotion)?32:1;
+            const int divisions=authored(actionMotion)?32:actionMotion==Motion::backFlipOut?backFlipExitSegments:
+                hopMotion(actionMotion)||supportRecoveryAction?32:1;
+            float scanPhase=actionTime;
             for(int knot=int(actionTime*divisions)+1;;++knot) {
-                const float phase=std::min(nextTime,float(knot)/divisions);
+                const float phase=authored(actionMotion)?authoredMotion(actionMotion).trajectory.nextPhase(scanPhase,std::min(nextTime,scanPhase+1.f/divisions)):std::min(nextTime,float(knot)/divisions);
 
                 const bool exitMotion=actionMotion==Motion::dropBack||actionMotion==Motion::backFlipOut;
-                target=actionPoint(exitMotion&&phase>=1?rawNextTime:phase);
-                if(actionMotion==Motion::backFlipOut)out.motion=actionMotion;
-                if(!clearPath(w,previous,target)||(roofTransfer&&!roofPathClear(w,previous,target))) {
+                target=actionPoint(exitMotion&&phase>=1&&!authored(actionMotion)?rawNextTime:phase);
+                const Vec targetNormal=phase>=1&&landingSupport?horizontal(landingSupport->normal):roofTransfer||supportRecoveryAction?roofFacing(phase):normal;
+                const Vec sourceNormal=roofTransfer||supportRecoveryAction?roofFacing(previousPhase):normal;
+                if(!clearPath(w,previous,target,false,targetNormal,sourceNormal)||(roofTransfer&&!roofPathClear(w,previous,target))) {
+                    if(supportRecoveryAction)if(auto retried=retrySupportRecovery(w,in,stamina))return *retried;
+                    if(!departing)return holdGeometry("jump path changed");
                     if(actionMotion==Motion::backFlipOut)out.releaseVelocity=checkedBackFlipAbortVelocity(w);
                     if(edgeAction){out.motion=actionMotion;out.releaseVelocity={0,0,-30};edgeAction=false;}
                     stop();out.released=true;out.reason="jump path changed";return out;
                 }
-                if(actionMotion==Motion::backFlipOut&&!w.actionBodyClear(actionMotion,previous,target,previousPhase,phase,actionLandingNormal)) {
+                const bool bodyClear=actionMotion!=Motion::backFlipOut||(authored(actionMotion)?
+                    w.actionBodyPathClear(actionMotion,previous,target,previousPhase,phase,actionLandingNormal,actionPoint((previousPhase+phase)*.5f)):
+                    w.actionBodyClear(actionMotion,previous,target,previousPhase,phase,actionLandingNormal));
+                if(!bodyClear) {
                     out.releaseVelocity=checkedBackFlipAbortVelocity(w);
                     stop();out.released=true;out.reason="back flip body clearance changed";return out;
                 }
-                if(flipMotion(actionMotion)&&phase>=.20f&&phase<=.80f&&!flipClearance(w,target)) {
-                    stop();out.released=true;out.reason="flip clearance changed";return out;
-                }
                 if(actionMotion>=Motion::kickUp&&actionMotion<=Motion::kickRight&&!kickClearance(w,target)) {
-                    stop();out.released=true;out.reason="kick body clearance changed";return out;
+                    return holdGeometry("kick body clearance changed");
                 }
                 if(phase>=nextTime)break;
-                previous=target;previousPhase=phase;
+                previous=target;previousPhase=phase;scanPhase=phase;
+            }
+            const auto landed=nextTime>=1&&!departing?(supportRecoveryAction?recoverySupport:
+                hopMotion(actionMotion)?landingSupport:support(w,target,actionLandingNormal*-1)):std::optional<Hit>{};
+            std::optional<Vec> standingLanding;
+            if(nextTime>=1&&!departing) {
+                if(edgeAction&&(!landed||std::abs(landed->normal.unit().z)>.12f||
+                    horizontal(landed->normal).dot(actionTargetEdge.normal)<.985f))
+                    return holdGeometry("edge catch body support changed");
+                if(hopMotion(actionMotion)||supportRecoveryAction) {
+                    if(!landed) {
+                        standingLanding=standingFloor(w,target,12,12);
+                        if(!standingLanding||!clearPath(w,target,*standingLanding,true))
+                            return holdGeometry("jump landing support lost");
+                    } else {
+                        const auto settled=offsetFromSurface(target,*landed);
+                        if((settled-target).length()>8)return holdGeometry("jump landing moved beyond reach");
+                        if(!clearPath(w,target,settled,false,horizontal(landed->normal))) {
+                            if(supportRecoveryAction)if(auto retried=retrySupportRecovery(w,in,stamina))return *retried;
+                            return holdGeometry("jump landing clearance blocked");
+                        }
+                    }
+                }
             }
             actionTime=nextTime;
-            position=target;out.motion=actionMotion;out.staminaCost=obstacleJump?cfg.drain*(running?2.f:1.f)*dt:cfg.hangDrain*dt;
-            if(roofTransfer) {
+            position=target;out.motion=actionMotion;out.staminaCost=departing?0.f:obstacleJump?cfg.drain*(running?2.f:1.f)*dt:cfg.hangDrain*dt;
+            if(roofTransfer||supportRecoveryAction) {
 
                 const float amount=ease((actionTime-.25f)/.65f);
-                const Vec from=horizontal(actionStartSurface),to=horizontal(actionTargetSurface);
-                const float angle=std::atan2(from.x*to.y-from.y*to.x,from.dot(to))*amount;
-                normal={from.x*std::cos(angle)-from.y*std::sin(angle),from.x*std::sin(angle)+from.y*std::cos(angle),0};
+                normal=roofFacing(actionTime);
                 surfaceNormal=(actionStartSurface*(1-amount)+actionTargetSurface*amount).unit();
             }
             if(actionTime>=1) {
                 if(actionMotion==Motion::drop||actionMotion==Motion::dropBack||actionMotion==Motion::backFlipOut) {
-                    if(actionMotion==Motion::dropBack)
+                    if(authored(actionMotion)&&actionMotion!=Motion::drop) {
+                        auto velocity=(actionPoint(1)-actionPoint(.998f))/(actionSeconds*.002f);
+                        if(velocity.length()>600)velocity=velocity.unit()*600;
+                        out.releaseVelocity=backJumpVelocity(w,velocity);
+                    }
+                    else if(actionMotion==Motion::dropBack)
                         out.releaseVelocity=backJumpVelocity(w,(actionTo-actionFrom)*(3.f/actionSeconds));
-                    if(actionMotion==Motion::backFlipOut)
+                    if(actionMotion==Motion::backFlipOut&&!authored(actionMotion))
                         out.releaseVelocity=backJumpVelocity(w,backFlipExitVelocity(actionLandingNormal));
                     stop();out.released=true;out.reason=actionMotion==Motion::backFlipOut?"manual back flip":
                         actionMotion==Motion::dropBack?"manual back push":"manual drop";
                 }
                 else {
 
-                    const auto landed=support(w,position,actionLandingNormal*-1);
-                    if(edgeAction&&(!landed||std::abs(landed->normal.unit().z)>.12f||
-                        horizontal(landed->normal).dot(actionTargetEdge.normal)<.985f)) {
-                        out.releaseVelocity={0,0,-30};edgeAction=false;
-                        stop();out.released=true;out.reason="edge catch body support changed";return out;
-                    }
-                    if(hopMotion(actionMotion)) {
+                    if(hopMotion(actionMotion)||supportRecoveryAction) {
                         if(!landed) {
-                            if(auto floor=standingFloor(w,position,12,12);floor&&clearPath(w,position,*floor,true)) {
-                                position=*floor;stop();out.released=out.completed=true;out.reason="jump reached standing surface";
-                            } else {stop();out.released=true;out.reason="jump landing support lost";}
+                            position=*standingLanding;stop();out.released=out.completed=true;out.reason="jump reached standing surface";
                         } else {
                             const auto settled=offsetFromSurface(position,*landed);
-                            if((settled-position).length()>8) {stop();out.released=true;out.reason="jump landing moved beyond reach";}
-                            else if(!clearPath(w,position,settled)) {stop();out.released=true;out.reason="jump landing clearance blocked";}
-                            else {
+                            {
                                 position=settled;normal=horizontal(landed->normal);surfaceNormal=landed->normal.unit();
 
-                                state=State::wall;actionCooldown=.18f;stalled=missingSurface=0;roofTransfer=false;
-                                edgeSettled=edgeAction;
+                                state=State::wall;actionCooldown=.18f;stalled=missingSurface=0;roofTransfer=supportRecoveryAction=false;
+                                edgeSettled=edgeAction&&!authored(actionMotion);
                                 if(obstacleJump) {
 
                                     const float remainder=std::max(0.f,(rawNextTime-1)*actionSeconds);
@@ -547,7 +851,7 @@ public:
         }
         if(state==State::approach) {
             const float nextPhase=std::min(1.0f,approachTime+dt/std::max(.01f,entrySeconds));
-            const auto next=entryPoint(approachFrom,approachTo,nextPhase,jumpEntry,approachLift);
+            const auto next=entryPathPoint(nextPhase);
             if(approachLift>0) {
                 const auto actual=support(w,approachTo,normal*-1);
                 if(!actual||(offsetFromSurface(approachTo,*actual)-approachTo).length()>2||
@@ -556,8 +860,16 @@ public:
                 }
             }
 
-            if((approachRounded&&!entrySideClear(w,approachTo))||
-                !entryPathClear(w,approachFrom,approachTo,jumpEntry,approachTime,nextPhase,position,approachLift,approachRounded)) {
+            bool pathClear=true;
+            if(authored(entryMotion)) {
+                Vec previous=position;float phase=approachTime;
+                while(phase<nextPhase) {
+                    phase=authoredMotion(entryMotion).trajectory.nextPhase(phase,std::min(nextPhase,phase+1.f/32));
+                    const auto point=entryPathPoint(phase);
+                    if(!clearPath(w,previous,point,approachRounded)){pathClear=false;break;}previous=point;
+                }
+            } else pathClear=entryPathClear(w,approachFrom,approachTo,jumpEntry,approachTime,nextPhase,position,approachLift,approachRounded);
+            if((approachRounded&&!entrySideClear(w,approachTo))||!pathClear) {
                 if(approachLift>0)out.releaseVelocity={0,0,-30};
                 stop();out.released=true;out.reason="entry path blocked";return out;
             }
@@ -566,24 +878,37 @@ public:
             return out;
         }
         if(state==State::mantle) {
-            const float next=std::min(1.0f,mantleTime+dt/topSeconds());
+            float next=std::min(1.0f,mantleTime+dt/topSeconds());
+            const float release=std::max(cfg.threepeatProfile.mantleRelease[0][1],cfg.threepeatProfile.mantleRelease[1][1]);
+            const bool tail=!cfg.authoredMantle&&cfg.threepeatMantleSeconds>0&&!lowTopStep()&&!mantleCrest&&topSamplePhase(next)>release;
+            if(tail) {
+                auto rate=[&](float phase){return 1.f+ease((topSamplePhase(phase)-release)/.14f);};
+                const float step=dt/(8.f*topSeconds());next=mantleTime;
+                for(int sample=0;sample<8;++sample)next+=step*rate(next+step*.5f*rate(next));
+                next=std::min(1.f,next);
+            }
             if(threepeatMantle&&((mantleTime<0&&(!support(w,position,normal*-1)||!edgeFeetSupported(w,position,normal)))||!threepeatTopStillValid(w,next))) {
-                out.motion=topMotion();out.releaseVelocity={0,0,-30};
-                stop();out.released=true;out.reason="new mantle support changed";return out;
+                return holdGeometry("new mantle support changed");
             }
             if(!threepeatMantle&&!adaptiveTopStillValid(w,next)) {
-                out.motion=topMotion();out.releaseVelocity={0,0,-30};
-                stop();out.released=true;out.reason="mantle support changed";return out;
+                return holdGeometry("mantle support changed");
             }
             if(mantleCrest&&next>=.60f) {
                 const auto support=crestStanding(w,mantleLip);
                 if(!support||(*support-mantleTo).length()>1) {
-                    stop();out.released=true;out.reason="roof crest support changed";return out;
+                    return holdGeometry("roof crest support changed");
                 }
             }
 
-            const Vec target=topPathPoint(next);
-            if(!clearPath(w,position,target,true)) { stop(); out.released=true;out.reason="top-out path changed";return out; }
+            Vec target=position;float phase=std::max(0.f,mantleTime);
+            do {
+                float point=tail||cfg.authoredMantle?std::min(next,phase+1.f/32.f):next;
+                if(cfg.authoredMantle)point=authoredMantleNextPhase(phase,point);
+                if(tail)for(float knot:{.60f,.88f})if(phase<knot&&point>knot)point=knot;
+                const Vec checked=topPathPoint(point);
+                if(!clearPath(w,target,checked,true))return holdGeometry("top-out path changed");
+                target=checked;phase=point;
+            }while(phase<next);
             position=target; mantleTime=next; out.motion=topMotion();
             if(next>=1) { stop(); out.released=true; out.completed=true;out.reason=mantleCrest?"roof crest reached":"top-out complete"; }
             return out;
@@ -591,7 +916,7 @@ public:
         if(edgePreparation.active)if(auto prepared=updateEdgePreparation(w,in,dt,stamina))return *prepared;
         bool manualHopTried=false;
 
-        if((cornerActive||std::abs(in.x)>.5f)&&!wallRunControls&&!running&&in.hop&&actionCooldown<=0&&stamina>=15.f) {
+        if(!recoveringWall&&(cornerActive||std::abs(in.x)>.5f)&&!wallRunControls&&!running&&in.hop&&actionCooldown<=0&&stamina>=15.f) {
             const bool sourceReady=cornerActive?
                 cornerJoinValid(w,cfg,cornerRoute)&&cornerGrip(w,cfg,cornerRoute,position,surfaceNormal):
                 support(w,position,normal*-1).has_value();
@@ -602,7 +927,7 @@ public:
             }
         }
 
-        if(!cornerActive&&!edgePreparation.active&&std::abs(in.x)>.5f&&
+        if(!recoveringWall&&!cornerActive&&!edgePreparation.active&&std::abs(in.x)>.5f&&
             std::abs(surfaceNormal.z)<=cfg.maxNormalZ&&cornerProbeCooldown<=0) {
             cornerProbeCooldown=.12f;
             if(auto route=findCornerRoute(w,cfg,position,surfaceNormal,in.x,
@@ -630,10 +955,13 @@ public:
             }
 
             const bool verticalFallback=std::abs(rise)>.00001f&&!verticalStep&&std::abs(input.x)<.1f;
-            auto step=verticalFallback?std::optional<CornerStep>{}:advanceCornerRoute(w,cfg,trial,travel,clear);
+            const bool checkedVertical=verticalStep&&travel==0.f&&std::isfinite(trial.distance)&&
+                trial.distance>.001f&&trial.distance<trial.length-.001f;
+            auto step=verticalFallback?std::optional<CornerStep>{}:checkedVertical?verticalStep:advanceCornerRoute(w,cfg,trial,travel,clear);
             bool shifted=verticalStep.has_value();
             bool lateral=step&&std::abs(trial.distance-cornerRoute.distance)>.00001f;
-            if(step&&shifted&&lateral&&(!clearPath(w,position,step->position)||!cornerBodyClear(w,cfg,position,step->position,inclinedCorner))) {
+            if(step&&(!clearPath(w,position,step->position,false,horizontal(step->normal))||
+                (shifted&&lateral&&!cornerBodyClear(w,cfg,position,step->position,inclinedCorner,true)))) {
 
                 if(std::abs(input.y)>std::abs(input.x)) {
                     trial=verticalRoute;step=verticalStep;lateral=false;
@@ -641,8 +969,11 @@ public:
                     trial=cornerRoute;step=advanceCornerRoute(w,cfg,trial,travel,clear);shifted=false;
                     lateral=step&&std::abs(trial.distance-cornerRoute.distance)>.00001f;
                 }
+                if(step&&!clearPath(w,position,step->position,false,horizontal(step->normal)))step.reset();
             }
-            if(!step&&verticalStep&&!verticalFallback) {trial=verticalRoute;step=verticalStep;shifted=true;lateral=false;}
+            if(!step&&verticalStep&&!verticalFallback&&clearPath(w,position,verticalStep->position,false,horizontal(verticalStep->normal))) {
+                trial=verticalRoute;step=verticalStep;shifted=true;lateral=false;
+            }
             if(step) {
                 cornerRoute=trial;
                 position=step->position;surfaceNormal=step->normal;normal=horizontal(surfaceNormal);
@@ -674,8 +1005,7 @@ public:
             }
             cornerActive=false;cornerProbeCooldown=.25f;
             if(!support(w,position,normal*-1)) {
-                out.motion=Motion::hang;out.releaseVelocity={0,0,-30};
-                stop();out.released=true;out.reason="corner support changed";return out;
+                return holdGeometry("corner support changed");
             }
         }
 
@@ -729,37 +1059,36 @@ public:
                 ledge->frontEdge?std::max(ledge->stand.z+4,ledge->lip.z+8):ledge->stand.z+4)};
             mantleTo=ledge->stand; mantleLip=ledge->lip; mantleTime=0;
 
-            roundedMantle=roundedMantleClear(w,mantleFrom,mantleApex,mantleTo);
-            mantleHands=ledge->hands;mantleHandNormals=ledge->normals;mantleCrest=ledge->crest;
-
-            ledgePull=(mantleLip.z-position.z)>=110;
-            threepeatMantle=selectThreepeatMantle(w);
-            mantleTime=lowTopStep()?0.f:-.60f/topSeconds();
-            state=State::mantle; out.motion=topMotion(); out.staminaCost=cfg.mantleCost;
-            return out;
+            roundedMantle=(!cfg.authoredMantle||!authoredPath(Motion::contextMantle))&&roundedMantleClear(w,mantleFrom,mantleApex,mantleTo);
+            if(cfg.authoredMantle&&!selectAuthoredMantlePath(w)) {
+                topSearchRetry.defer(position,surfaceNormal,searchInput,searchMode,.12f,standingTopPath);
+                ledgeReason=authoredQueryBudgetExhausted?"authored mantle query budget exhausted":"authored mantle path blocked";
+                ledge.reset();state=State::wall;
+            } else {
+                mantleHands=ledge->hands;mantleHandNormals=ledge->normals;mantleCrest=ledge->crest;
+                ledgePull=(mantleLip.z-position.z)>=110;
+                threepeatMantle=!cfg.authoredMantle&&selectThreepeatMantle(w);
+                mantleTime=cfg.authoredMantle||lowTopStep()?0.f:-.60f/topSeconds();
+                state=State::mantle; out.motion=topMotion(); out.staminaCost=cfg.mantleCost;
+                return out;
+            }
         }
         auto current=support(w,position,normal*-1,ledge.has_value());
         bool directSupport=current.has_value();
         if(!current) {
-            missingSurface+=dt;blockedReason="surface temporarily missing";
+            missingSurface=std::min(2.f,missingSurface+dt);blockedReason="surface temporarily missing";
 
             for(float z:{18.f,-18.f,-36.f}) {
                 current=support(w,position+Vec{0,0,z},normal*-1);
                 if(current)break;
             }
             if(!current) {
-                resetAutomaticClock();
-                out.motion=Motion::hang;
-                out.staminaCost=0;
-                if(missingSurface>1.2f){stop();out.released=true;out.reason="support lost after retries";}
-                return out;
+                if(auto recovery=trySupportRecovery(w,in,stamina))return *recovery;
+                return holdGeometry("wall support unavailable; holding position");
             }
         }
         if(directSupport)missingSurface=0;
-        else if(missingSurface>1.2f) {
 
-            stop();out.released=true;out.reason="only displaced support remains";return out;
-        }
         in.x=std::clamp(in.x,-1.0f,1.0f); in.y=std::clamp(in.y,-1.0f,1.0f);
         const float magnitude=std::sqrt(in.x*in.x+in.y*in.y);
         if(magnitude>1) { in.x/=magnitude; in.y/=magnitude; }
@@ -813,6 +1142,21 @@ public:
                 hasDestinationSupport=true;
                 const auto newNormal=horizontal(h->normal);
                 if(newNormal.dot(normal)>-.05f) {
+                    const float turn=std::acos(std::clamp(normal.dot(newNormal),-1.f,1.f));
+                    const float amount=turn>12*dt?12*dt/turn:1.f;
+                    const auto nextNormal=(normal*(1-amount)+newNormal*amount).unit();
+                    auto accept=[&](Vec target,float margin) {
+                        if(!clearPath(w,position,target,false,nextNormal)||
+                            ((newNormal-nextNormal).length()>.00001f&&!clearPath(w,target,target,false,newNormal,nextNormal,true,true)))return false;
+                        if(running&&!runwayClear(w,target)) {
+                            runwayRejected=true;runClearanceCooldown=.45f;return false;
+                        }
+                        moving=(target-position).dot(next-position)>.00001f;
+                        position=target;missingSurface=0;clearanceMargin=margin;accepted=true;
+                        normal=nextNormal;
+                        surfaceNormal=(surfaceNormal*(1-std::min(1.f,dt*8))+h->normal.unit()*std::min(1.f,dt*8)).unit();
+                        return true;
+                    };
                     std::optional<Vec> checkedPoint;
                     bool checkedSupport{};
                     for(float outward:{std::max(0.f,clearanceMargin-dt*2),4.f,9.f,14.f}) {
@@ -828,22 +1172,13 @@ public:
                         checkedPoint=corrected;checkedSupport=needsSupport;
                         if(needsSupport&&!support(w,corrected,newNormal*-1))continue;
                         blockedReason="body clearance";
-                        if(clearPath(w,position,corrected)) {
-                            if(running&&!runwayClear(w,corrected)) {
-
-                                runwayRejected=true;runClearanceCooldown=.45f;continue;
-                            }
-                            moving=(corrected-position).dot(next-position)>.00001f;
-                            position=corrected;
-                            missingSurface=0;
-                            clearanceMargin=outward;accepted=true;
-
-                            const float turn=std::acos(std::clamp(normal.dot(newNormal),-1.f,1.f));
-                            const float amount=turn>12*dt?12*dt/turn:1.f;
-                            normal=(normal*(1-amount)+newNormal*amount).unit();
-                            surfaceNormal=(surfaceNormal*(1-std::min(1.f,dt*8))+h->normal.unit()*std::min(1.f,dt*8)).unit();
-                            break;
-                        }
+                        if(accept(corrected,outward))break;
+                    }
+                    if(!accepted&&!runwayRejected) {
+                        const float before=(position-offsetFromSurface(position,*h)).dot(newNormal);
+                        const float after=(candidate-offsetFromSurface(candidate,*h)).dot(newNormal);
+                        if(before>.05f&&after>=-.01f&&after<=before+.01f)
+                            accept(candidate,std::max(0.f,after));
                     }
                 } else blockedReason="corner exceeds turn limit";
             }
@@ -896,18 +1231,30 @@ public:
             struct Prefix {bool checked{},clear{};std::optional<Hit> hit;Vec from{},to{};};
             std::array<Prefix,3> prefixes{};
             const bool sideways=std::abs(in.x)>.6f;
+            const auto recoveryMotion=sideways?(in.x<0?Motion::hopLeft:Motion::hopRight):Motion::hopUp;
+            AuthoredQueryWorld bounded(w);
+            World& recoveryWorld=authored(recoveryMotion)?static_cast<World&>(bounded):w;
             for(unsigned candidate=0;candidate<(sideways?1u:4u);++candidate) {
+                if(bounded.exhausted)break;
                 const float rise=rises[candidate];
                 const Vec advance=sideways?right*(in.x<0?-48.f:48.f):Vec{0,0,rise};
                 const auto wanted=position+advance;
-                const auto destination=support(w,wanted,normal*-1,false,true);
+                const auto destination=support(recoveryWorld,wanted,normal*-1,false,true);
                 if(!destination)continue;
-                const auto anchor=landingAnchor(w,wanted,*destination);
+                const auto anchor=landingAnchor(recoveryWorld,wanted,*destination);
                 if(!anchor||horizontal(anchor->hit.normal).dot(normal)<=.6f)continue;
                 const auto target=anchor->position;
                 for(std::size_t index=0;index<prefixes.size();++index) {
+                    if(bounded.exhausted)break;
                     const float clearance=clearances[index];
                     const Vec a=position+normal*clearance,b=target+normal*clearance;
+                    const auto motion=recoveryMotion;
+                    if(authored(motion)) {
+                        if(commitAuthoredRoute(recoveryWorld,motion,target,.55f+rise*.002f,horizontal(anchor->hit.normal),true,a,b)) {
+                            out.motion=actionMotion;out.staminaCost=hopCost;blockedReason="checked obstacle hop";return out;
+                        }
+                        continue;
+                    }
                     auto& prefix=prefixes[index];
                     if(!prefix.checked) {
                         prefix.clear=clearPath(w,position,a);prefix.checked=true;
@@ -915,8 +1262,7 @@ public:
                     } else if(!prefix.clear) {
                         blockedHit=prefix.hit;blockedFrom=prefix.from;blockedTo=prefix.to;
                     }
-                    if(prefix.clear&&clearPath(w,a,b)&&clearPath(w,b,target)) {
-                        const auto motion=sideways?(in.x<0?Motion::hopLeft:Motion::hopRight):Motion::hopUp;
+                    if(prefix.clear&&clearPath(w,a,b)&&clearPath(w,b,target,false,horizontal(anchor->hit.normal))) {
                         beginAction(motion,position,target,.55f+rise*.002f);
                         actionLandingNormal=horizontal(anchor->hit.normal);
                         detour=true;detourOut=a;detourOver=b;out.motion=actionMotion;out.staminaCost=hopCost;
@@ -924,6 +1270,8 @@ public:
                     }
                 }
             }
+            authoredQueryBudgetExhausted|=bounded.exhausted;
+            if(bounded.exhausted)blockedReason="authored obstacle query budget exhausted";
             hopSearchRetry.defer(position,surfaceNormal,searchInput,searchMode,.20f);
         }
         if(!wallRunControls&&!running&&!accepted&&!runwayRejected&&in.y>=0&&magnitude>.1f&&
@@ -936,7 +1284,9 @@ public:
                 out.motion=actionMotion;out.staminaCost=hopCost;blockedReason="checked eave bypass";return out;
             }
         }
-        if(moving){detourProbe=0;blockedHit.reset();blockedReason="none";}
+        if(!accepted&&!runwayRejected&&stalled>.35f&&(!directSupport||(ledge&&in.y<-.1f&&!gripSupport(w,position,*current,true)))&&(!wallRunControls||cfg.wallRunObstacleJumps))
+            if(auto recovery=trySupportRecovery(w,in,stamina))return *recovery;
+        if(moving){detourProbe=0;blockedHit.reset();blockedReason="none";supportRecoveryCursor=0;supportRecoveryInput={};}
 
         if(moving&&accepted&&automaticInputAllowed(in,wallRunControls)&&stamina>=hopCost+cfg.drain*dt) {
             if(automaticInterval<=0) {
@@ -995,18 +1345,45 @@ public:
     }
 
 private:
+    Motion heldMotion() const {
+        return state==State::approach?entryMotion:state==State::mantle?topMotion():
+            state==State::action?actionMotion:Motion::hang;
+    }
+    Result heldResult(const char* reason) {
+        Result out;out.motion=heldMotion();out.reason=blockedReason=reason;return out;
+    }
+    Result holdGeometry(const char* reason) {
+        geometryHeld=true;geometryRetry=.15f;moveDirection={};resetAutomaticClock();
+        if(state==State::wall||state==State::ledge) {
+            running=false;runBlend=diagonalRunBlend=0;stableMotion=Motion::hang;
+            cornerActive=edgeAction=edgeSettled=edgePreparation.active=automaticPreparation=false;
+        }
+        return heldResult(reason);
+    }
+    Vec roofFacing(float phase) const {
+        const Vec from=horizontal(actionStartSurface),to=horizontal(actionTargetSurface);
+        const float angle=std::atan2(from.x*to.y-from.y*to.x,from.dot(to))*ease((phase-.25f)/.65f);
+        return {from.x*std::cos(angle)-from.y*std::sin(angle),from.x*std::sin(angle)+from.y*std::cos(angle),0};
+    }
     Vec mantleFrom{},mantleApex{},mantleTo{},mantleLip{},approachFrom{},approachTo{};
     std::array<Vec,2> mantleHands{},mantleHandNormals{};
     float mantleTime{},approachTime{},approachLift{},entrySeconds=.32f;
     bool approachRounded{},entryUsedTopFallback{};float entryTopRise{};
     bool ledgePull{},roundedMantle{},mantleCrest{},threepeatMantle{};
+    AuthoredTrajectory mantleRoute;
     Vec actionFrom{},actionTo{};
     float actionTime{},actionSeconds=1,actionCooldown{},stalled{},clearanceMargin{},runBlend{},diagonalRunBlend{},hopDistance{};
     Motion actionMotion=Motion::none,entryMotion=Motion::reach;
+    Motion actionWallRunDirection=Motion::none;
     Motion stableMotion=Motion::hang;
     bool running{},jumpEntry{},detour{},actionBeganRunning{};
     Vec actionDirection{},actionLandingNormal{};
-    float missingSurface{},runClearanceCooldown{};
+    float missingSurface{},runClearanceCooldown{},geometryRetry{};
+    bool geometryHeld{},staminaResting{};
+    float supportRecoveryRetry{};
+    Vec supportRecoveryOrigin{},supportRecoveryInput{};
+    unsigned supportRecoveryCursor{};
+    bool supportRecoveryAction{};
     Vec moveDirection{},detourOut{},detourOver{};
     unsigned detourProbe{};
     bool roofTransfer{};
@@ -1028,6 +1405,7 @@ private:
     Vec automaticDirection{};
     bool automaticPreparation{};
     bool obstacleJump{};
+    bool authoredActionChecked{},authoredActionRejected{},authoredBackFlipPrechecked{},entryPose{};
     unsigned obstacleJumps{};
     float obstacleProbeCooldown{},actionRunSpeed{};
     void resetAutomaticClock() {automaticElapsed=automaticInterval=automaticBlocked=automaticRetry=automaticOpportunityRetry=0;automaticDirection={};}
@@ -1049,7 +1427,8 @@ private:
             !edgePreparation.active&&!input.hop&&!input.release&&!input.backDrop&&
             input.y>=0&&std::hypot(input.x,input.y)>.1f&&actionCooldown<=0;
     }
-    void beginAction(Motion motion,Vec from,Vec to,float seconds) {
+    void beginAction(Motion motion,Vec from,Vec to,float seconds,Motion wallRunDirection=Motion::none) {
+        supportRecoveryAction=false;
         topSearchRetry.reset();hopSearchRetry.reset();
         resetAutomaticClock();automaticPreparation=false;
         actionBeganRunning=running||runMotion(stableMotion);
@@ -1057,73 +1436,231 @@ private:
         actionDirection=moveDirection;
         if(actionDirection.length()<.1f)actionDirection={0,1,0};
         actionLandingNormal=normal;
-        actionMotion=motion;actionFrom=from;actionTo=to;actionSeconds=seconds;actionTime=0;state=State::action;detour=false;roofTransfer=false;edgeAction=edgeSettled=false;
+        authoredActionChecked=authoredActionRejected=false;entryPose=false;
+        const int directionIndex=wallRunDirectionIndex(wallRunDirection);
+        actionWallRunDirection=directionIndex>=0&&cfg.authoredWallRunSequences&&cfg.authoredWallRunSequences->valid[directionIndex]&&
+            (wallRunLaunch(motion)||motion==Motion::runCatch||motion==Motion::sideBrace)?wallRunDirection:Motion::none;
+        actionMotion=motion;actionFrom=from;actionTo=to;actionSeconds=motionDuration(motion,seconds);actionTime=0;state=State::action;detour=false;roofTransfer=false;edgeAction=edgeSettled=false;
         cornerActive=false;edgePreparation.active=false;
     }
+    bool commitAuthoredRoute(World& w,Motion motion,Vec target,float seconds,Vec landing={},bool routed=false,Vec outside={},Vec over={},bool roof=false,Vec targetSurface={},float outward=0,float sourceSpeed=0) {
+        auto candidate=*this;candidate.beginAction(motion,position,target,seconds);
+        candidate.actionLandingNormal=landing.length()>.9f?landing:normal;
+        candidate.detour=routed;candidate.detourOut=outside;candidate.detourOver=over;candidate.roofTransfer=roof;
+        candidate.actionStartSurface=surfaceNormal;candidate.actionTargetSurface=targetSurface.length()>.9f?targetSurface:surfaceNormal;
+        candidate.hopDistance=outward;
+        if(sourceSpeed>0){candidate.actionRunSpeed=sourceSpeed;candidate.actionBeganRunning=true;}
+        if(!candidate.authoredActionClear(w)){authoredQueryBudgetExhausted|=candidate.authoredQueryBudgetExhausted;return false;}
+        candidate.authoredActionChecked=true;*this=std::move(candidate);return true;
+    }
+
+    std::optional<Result> trySupportRecovery(World& world,Input input,float stamina) {
+        if(!std::isfinite(input.x)||!std::isfinite(input.y)||std::hypot(input.x,input.y)<=.1f)return {};
+        const Vec intent=Vec{std::clamp(input.x,-1.f,1.f),std::clamp(input.y,-1.f,1.f),0}.unit();
+        if(intent.length()<.5f||input.release||actionCooldown>0||stamina<15.f||
+            (state!=State::wall&&state!=State::ledge))return {};
+        if(supportRecoveryInput.length()<.5f||supportRecoveryInput.dot(intent)<.7f||
+            (position-supportRecoveryOrigin).length()>4) {
+            supportRecoveryInput=intent;supportRecoveryOrigin=position;
+            supportRecoveryCursor=0;supportRecoveryRetry=0;
+        }
+        if(supportRecoveryRetry>0)return {};
+        supportRecoveryRetry=.4f;
+        const Vec facing=horizontal(surfaceNormal),right{-facing.y,facing.x,0};
+        const Vec vertical=(Vec{0,0,1}-surfaceNormal*surfaceNormal.z).unit();
+        const Vec direction=(right*intent.x+vertical*intent.y).unit();
+        const Vec cross=(right*-intent.y+vertical*intent.x).unit();
+        const bool descending=intent.y<-.5f&&std::abs(intent.x)<.5f;
+        const Motion motion=descending?Motion::down:std::abs(intent.x)>.5f?
+            (intent.x<0?Motion::hopLeft:Motion::hopRight):Motion::hopUp;
+        const unsigned count=descending?6u:12u;
+        constexpr std::array<float,4> distances{24.f,48.f,80.f,112.f};
+        constexpr std::array<float,3> deviations{0.f,16.f,-16.f};
+        constexpr std::array<float,5> angles{0.f,-.7f,.7f,-1.3f,1.3f};
+        AuthoredQueryWorld bounded(world,4096);
+        for(unsigned attempt=0;attempt<4&&!bounded.exhausted;++attempt) {
+            const unsigned index=supportRecoveryCursor%count;
+            supportRecoveryCursor=(index+1)%count;
+            const Vec probe=position+direction*distances[index/3]+cross*deviations[index%3];
+            std::optional<Anchor> anchor;
+            for(float angle:angles) {
+                const Vec forward{-(facing.x*std::cos(angle)-facing.y*std::sin(angle)),
+                    -(facing.x*std::sin(angle)+facing.y*std::cos(angle)),0};
+                for(float height:{cfg.chest,cfg.grip,32.f}) {
+                    const Vec center=probe+Vec{0,0,height};
+                    const auto hit=bounded.ray(center-forward*16.f,center+forward*cfg.reach);
+                    if(!hit||!hit->climbable||!hit->point.finite()||!hit->normal.finite()||
+                        hit->normal.length()<.5f)continue;
+                    const auto n=hit->normal.unit();
+                    if(n.z<-.45f||n.z>std::max(.94f,cfg.maxNormalZ)||horizontal(n).dot(normal)<-.05f)continue;
+                    const auto next=landingAnchor(bounded,probe,*hit);
+                    if(!next)continue;
+                    const Vec delta=next->position-position;
+                    if(delta.length()>144.f||delta.dot(direction)<8.f||
+                        delta.dot(direction)<delta.length()*.4f||
+                        (next->position-probe).length()>cfg.reach||
+                        (descending&&(delta.z>-.5f||delta.length()>64.f)))continue;
+                    if(!recoveryLanding(bounded,next->position,next->hit.normal))continue;
+                    anchor=next;break;
+                }
+                if(anchor||bounded.exhausted)break;
+            }
+            if(!anchor)continue;
+            const Vec landing=horizontal(anchor->hit.normal);
+            for(float outward:{0.f,12.f,24.f}) {
+                auto candidate=*this;
+                candidate.beginAction(motion,position,anchor->position,
+                    std::clamp((anchor->position-position).length()/160.f,.28f,.80f));
+                candidate.supportRecoveryAction=true;candidate.geometryHeld=false;candidate.geometryRetry=0;
+                candidate.running=false;candidate.runBlend=candidate.diagonalRunBlend=0;
+                candidate.actionLandingNormal=landing;candidate.actionStartSurface=surfaceNormal;
+                candidate.actionTargetSurface=anchor->hit.normal.unit();candidate.actionDirection=intent;
+                candidate.detour=true;candidate.detourOut=position+normal*outward;
+                candidate.detourOver=anchor->position+landing*outward;
+                if(!candidate.authoredActionClear(bounded)) {
+                    if(bounded.exhausted)break;
+                    continue;
+                }
+                if(bounded.exhausted)break;
+                candidate.authoredActionChecked=true;candidate.stalled=candidate.missingSurface=0;
+                candidate.supportRecoveryCursor=0;candidate.supportRecoveryRetry=.4f;
+                candidate.blockedReason="checked nearby support recovery";
+                *this=std::move(candidate);
+                Result result;result.motion=actionMotion;result.staminaCost=15.f;
+                result.reason=blockedReason;return result;
+            }
+        }
+        if(bounded.exhausted)blockedReason="support recovery query budget exhausted";
+        return {};
+    }
+
+    std::optional<Result> retrySupportRecovery(World& world,Input input,float stamina) {
+        if(!supportRecoveryAction||!std::isfinite(input.x)||!std::isfinite(input.y)||
+            std::hypot(input.x,input.y)<=.1f||input.release||stamina<15.f)return {};
+        const Vec intent=Vec{std::clamp(input.x,-1.f,1.f),std::clamp(input.y,-1.f,1.f),0}.unit();
+        if(supportRecoveryRetry>0&&(position-supportRecoveryOrigin).length()<=4&&
+            supportRecoveryInput.dot(intent)>=.7f)return {};
+        AuthoredQueryWorld bounded(world,4096);
+        if(const auto current=recoveryLanding(bounded,position,surfaceNormal)) {
+            const auto facing=horizontal(current->normal);
+            if(facing.dot(normal)>=.95f&&clearPath(bounded,position,position,false,facing)&&!bounded.exhausted) {
+                state=State::wall;supportRecoveryAction=geometryHeld=false;geometryRetry=0;
+                edgeAction=edgeSettled=cornerActive=detour=roofTransfer=false;
+                edgePreparation.active=automaticPreparation=false;
+                running=false;runBlend=diagonalRunBlend=0;moveDirection={};stableMotion=Motion::hang;
+                normal=facing;surfaceNormal=current->normal.unit();stalled=missingSurface=0;
+                actionCooldown=.18f;supportRecoveryRetry=.4f;supportRecoveryCursor=0;
+                supportRecoveryOrigin=position;supportRecoveryInput=intent;
+                blockedReason="recovery returned to verified current support";
+                Result result;result.motion=Motion::hang;result.reason=blockedReason;return result;
+            }
+        }
+        auto candidate=*this;candidate.state=State::wall;candidate.geometryHeld=false;
+        candidate.supportRecoveryAction=false;candidate.actionCooldown=0;
+        const auto result=candidate.trySupportRecovery(bounded,input,stamina);
+        if(result&&!bounded.exhausted) {*this=std::move(candidate);return result;}
+        supportRecoveryRetry=candidate.supportRecoveryRetry;supportRecoveryCursor=candidate.supportRecoveryCursor;
+        supportRecoveryOrigin=candidate.supportRecoveryOrigin;supportRecoveryInput=candidate.supportRecoveryInput;
+        return {};
+    }
+
+    struct ProbeRayCache final:World {
+        struct Entry {Vec from,to;std::optional<Hit> hit;bool valid{};};
+        World& source;std::array<Entry,256> entries{};
+        explicit ProbeRayCache(World& world):source(world){}
+        std::optional<Hit> ray(Vec from,Vec to) override {
+            std::uint32_t hash=2166136261u;
+            for(float value:{from.x,from.y,from.z,to.x,to.y,to.z})hash=(hash^std::bit_cast<std::uint32_t>(value))*16777619u;
+            hash^=hash>>16;hash*=0x7feb352du;hash^=hash>>15;
+            auto& entry=entries[hash&(entries.size()-1)];
+            auto equal=[](Vec a,Vec b){return a.x==b.x&&a.y==b.y&&a.z==b.z;};
+            if(entry.valid&&equal(entry.from,from)&&equal(entry.to,to))return entry.hit;
+            const auto result=source.ray(from,to);entry={from,to,result,true};return result;
+        }
+        bool actionBodyClear(Motion motion,Vec from,Vec to,float begin,float end,Vec normal) override {
+            return source.actionBodyClear(motion,from,to,begin,end,normal);
+        }
+        bool actionBodyPathClear(Motion motion,Vec from,Vec to,float begin,float end,Vec normal,Vec middle) override {
+            return source.actionBodyPathClear(motion,from,to,begin,end,normal,middle);
+        }
+    };
 
     std::optional<Result> tryWallRunObstacle(World& world,Vec heading,float speed,Input input,float stamina) {
 
         struct BudgetWorld final:World {
-            World& source;unsigned count{};bool exhausted{};
-            explicit BudgetWorld(World& value):source(value){}
+            World& source;unsigned count{},limit{};bool exhausted{};
+            BudgetWorld(World& value,unsigned maximum):source(value),limit(maximum){}
             std::optional<Hit> ray(Vec a,Vec b)override {
-                if(count>=4096){exhausted=true;return Hit{a,(a-b).unit(),false};}
+                if(count>=limit){exhausted=true;return Hit{a,(a-b).unit(),false};}
                 ++count;return source.ray(a,b);
             }
-        } w(world);
+        } budget(world,authored(std::abs(input.x)<.1f?Motion::kickUp:input.x<0?Motion::kickLeft:Motion::kickRight)?12288:4096);
+        ProbeRayCache w(budget);
         const float lookAhead=110.f+std::abs(input.x)*12.f;
         if(heading.length()<.9f||clearPath(w,position,position+heading*lookAhead)||!blockedHit)return {};
         const Hit obstacle=*blockedHit;
+        const Motion selected=std::abs(input.x)<.1f?Motion::kickUp:input.x<0?Motion::kickLeft:Motion::kickRight;
         const float beyond=(obstacle.point-position).dot(heading)+cfg.radius+16;
         if(!kickClearance(w,position))return {};
         const Vec savedFrom=actionFrom,savedTo=actionTo;
         const float savedDistance=hopDistance,savedSeconds=actionSeconds,savedSpeed=actionRunSpeed;
-        const bool savedRunning=actionBeganRunning,savedArc=flipArc;
+        const bool savedRunning=actionBeganRunning;
         auto restore=[&] {
             actionFrom=savedFrom;actionTo=savedTo;hopDistance=savedDistance;actionSeconds=savedSeconds;
-            actionRunSpeed=savedSpeed;actionBeganRunning=savedRunning;flipArc=savedArc;
+            actionRunSpeed=savedSpeed;actionBeganRunning=savedRunning;
         };
         for(float distance:{224.f,320.f,416.f}) {
             if(distance<=beyond)continue;
             const Vec wanted=position+heading*distance;
             const auto destination=support(w,wanted,normal*-1,false,true);
-            if(!destination||w.exhausted)continue;
+            if(!destination||budget.exhausted)continue;
             const auto anchor=landingAnchor(w,wanted,*destination);
             if(!anchor||horizontal(anchor->hit.normal).dot(normal)<.985f||
                 std::abs(anchor->hit.normal.unit().z-surfaceNormal.z)>.10f)continue;
             const Vec target=anchor->position;
 
             if(input.y>.1f&&obstacle.normal.z<-.5f&&target.z<obstacle.point.z+cfg.radius+16)continue;
-            if((target-wanted).length()>8||!clearPath(w,target,target)||!runwayClear(w,target)||!kickClearance(w,target))continue;
+            if((target-wanted).length()>8||!clearPath(w,target,target,false,horizontal(anchor->hit.normal))||!runwayClear(w,target)||!kickClearance(w,target))continue;
+            bool sourceChecked=false;
             for(float outward:{std::max(52.f,cfg.kickOut),78.f,104.f}) {
                 const float seconds=wallRunObstacleDuration((target-position).length(),speed,outward);
-                if(stamina<30.f+2*cfg.drain*(seconds+.05f))continue;
-                actionFrom=position;actionTo=target;hopDistance=outward;flipArc=false;
+                if(stamina<30.f+2*cfg.drain*(motionDuration(selected,seconds)+.05f))continue;
+                if(authored(selected)) {
+                    if(sourceChecked&&authoredPath(selected))break;
+                    sourceChecked=true;
+                    const bool valid=commitAuthoredRoute(w,selected,target,seconds,horizontal(anchor->hit.normal),false,{},{},false,{},outward,speed);
+                    if(budget.exhausted){obstacleProbeCooldown=.25f;return {};}
+                    if(!valid)continue;
+                    actionRunSpeed=speed;actionBeganRunning=true;obstacleJump=true;++obstacleJumps;obstacleProbeCooldown=.5f;
+                    blockedReason="automatic checked wall-run obstacle jump";
+                    Result result;result.motion=selected;result.staminaCost=30.f;result.reason=blockedReason;return result;
+                }
+                actionFrom=position;actionTo=target;hopDistance=outward;
                 actionBeganRunning=true;actionSeconds=seconds;actionRunSpeed=speed;
                 Vec previous=position;bool valid=true;
                 for(int knot=1;knot<=32;++knot) {
                     const Vec point=hopPoint(knot/32.f);
-                    if(!clearPath(w,previous,point)||w.exhausted){valid=false;break;}
+                    if(!clearPath(w,previous,point,false,knot==32?horizontal(anchor->hit.normal):normal)||budget.exhausted){valid=false;break;}
                     previous=point;
                 }
                 if(valid)for(int knot=1;knot<=32;++knot)
-                    if(!kickClearance(w,hopPoint(knot/32.f))||w.exhausted){valid=false;break;}
+                    if(!kickClearance(w,hopPoint(knot/32.f))||budget.exhausted){valid=false;break;}
                 restore();
-                if(w.exhausted){obstacleProbeCooldown=.25f;return {};}
+                if(budget.exhausted){obstacleProbeCooldown=.25f;return {};}
                 if(!valid)continue;
                 const Motion motion=std::abs(input.x)<.1f?Motion::kickUp:
                     input.x<0?Motion::kickLeft:Motion::kickRight;
                 beginAction(motion,position,target,seconds);
-                hopDistance=outward;flipArc=false;actionRunSpeed=speed;obstacleJump=true;++obstacleJumps;
+                hopDistance=outward;actionRunSpeed=speed;obstacleJump=true;++obstacleJumps;
                 actionLandingNormal=horizontal(anchor->hit.normal);obstacleProbeCooldown=.5f;
                 blockedReason="automatic checked wall-run obstacle jump";
                 Result result;result.motion=motion;result.staminaCost=30.f;result.reason=blockedReason;return result;
             }
-            if(w.exhausted)break;
+            if(budget.exhausted)break;
         }
         restore();return {};
     }
-    std::optional<Result> tryManualHop(World& w,Input input,bool allowEdge) {
+    std::optional<Result> tryManualHop(World& originalWorld,Input input,bool allowEdge) {
         input.x=std::clamp(input.x,-1.f,1.f);input.y=std::clamp(input.y,-1.f,1.f);
         const float magnitude=std::hypot(input.x,input.y);
         if(magnitude>1){input.x/=magnitude;input.y/=magnitude;}
@@ -1132,22 +1669,26 @@ private:
         const Vec delta=sideways?right*(input.x<0?-90.f:90.f)+Vec{0,0,input.y>0?55.f:0.f}:Vec{0,0,70.f};
         const auto motion=sideways?(input.x<0?Motion::hopLeft:Motion::hopRight):Motion::hopUp;
         Result result;
-        if(allowEdge&&prepareEdgeAction(w,motion,{input.x,input.y,0})) {
-
+        if(allowEdge&&prepareEdgeAction(originalWorld,motion,{input.x,input.y,0})) {
             cornerActive=false;
-            result.motion=actionMotion;result.staminaCost=state==State::action?15.f:0;
-            blockedReason="measured edge-to-edge hop";return result;
+            Result value;value.motion=actionMotion;value.staminaCost=state==State::action?15.f:0;
+            blockedReason="measured edge-to-edge hop";return value;
         }
+        AuthoredQueryWorld w(originalWorld,authored(motion)?AuthoredQueryWorld::authoredLimit:4096);
         const Vec wanted=position+delta;
-        if(auto grab=support(w,wanted,normal*-1,false,true))if(const auto anchor=landingAnchor(w,wanted,*grab)) {
-            const Vec target=anchor->position;
-            if(horizontal(anchor->hit.normal).dot(normal)>.7f&&checkedHop(w,position,target,cfg.hopOut)) {
-                beginAction(motion,position,target,jumpActionSeconds(false));
-                actionLandingNormal=horizontal(anchor->hit.normal);
-                result.motion=actionMotion;result.staminaCost=15.f;return result;
-            }
+        const auto grab=support(w,wanted,normal*-1,false,true);
+        const auto anchor=grab?landingAnchor(w,wanted,*grab):std::nullopt;
+        if(w.exhausted||!anchor||!(horizontal(anchor->hit.normal).dot(normal)>.7f))return {};
+        auto candidate=*this;
+        candidate.beginAction(motion,position,anchor->position,jumpActionSeconds(false));
+        candidate.actionLandingNormal=horizontal(anchor->hit.normal);candidate.hopDistance=cfg.hopOut;
+        if(!candidate.authoredActionClear(w)||w.exhausted) {
+            authoredQueryBudgetExhausted|=w.exhausted||candidate.authoredQueryBudgetExhausted;
+            if(authoredQueryBudgetExhausted)blockedReason="authored hop query budget exhausted";
+            return {};
         }
-        return {};
+        candidate.authoredActionChecked=true;*this=std::move(candidate);
+        result.motion=actionMotion;result.staminaCost=15.f;return result;
     }
 #include "EdgeActions.h"
 #include "EaveTraversal.h"
@@ -1180,8 +1721,9 @@ private:
         }
         return true;
     }
-    bool tryRoofTransfer(World& w) {
+    bool tryRoofTransfer(World& world) {
         if(std::abs(surfaceNormal.z)>.25f)return false;
+        AuthoredQueryWorld w(world,authored(Motion::hopUp)?AuthoredQueryWorld::authoredLimit:2048);
         for(float inset:{12.f,18.f}) {
             const Vec over=position-normal*(cfg.gap+clearanceMargin+inset);
             const auto seed=w.ray(over+Vec{0,0,cfg.grip+28},over-Vec{0,0,16});
@@ -1202,15 +1744,21 @@ private:
                     (anchor->position-position).length()>cfg.reach+32||!gripSupport(w,anchor->position,anchor->hit,true))continue;
                 const Vec target=anchor->position;
                 const Vec above{target.x,target.y,apexZ};
+                if(authored(Motion::hopUp)) {
+                    if(commitAuthoredRoute(w,Motion::hopUp,target,.80f,horizontal(anchor->hit.normal),true,apex,above,true,anchor->hit.normal.unit()))return true;
+                    continue;
+                }
                 if(!prefixClear.has_value())prefixClear=clearPath(w,position,apex)&&roofPathClear(w,position,apex);
                 if(!*prefixClear)break;
                 if(!clearPath(w,apex,above)||!roofPathClear(w,apex,above)||
                     !clearPath(w,above,target)||!roofPathClear(w,above,target))continue;
-                const Vec startSurface=surfaceNormal;
-                beginAction(Motion::hopUp,position,target,.80f);
-                detour=true;detourOut=apex;detourOver=above;roofTransfer=true;
-                actionStartSurface=startSurface;actionTargetSurface=anchor->hit.normal.unit();
-                actionLandingNormal=horizontal(actionTargetSurface);
+                auto planned=*this;
+                planned.beginAction(Motion::hopUp,position,target,.80f);
+                planned.detour=true;planned.detourOut=apex;planned.detourOver=above;planned.roofTransfer=true;
+                planned.actionStartSurface=surfaceNormal;planned.actionTargetSurface=anchor->hit.normal.unit();
+                planned.actionLandingNormal=horizontal(planned.actionTargetSurface);
+                if(!planned.authoredActionClear(w,true)||w.exhausted)continue;
+                *this=std::move(planned);
                 return true;
             }
         }
@@ -1225,8 +1773,16 @@ private:
         if(clearPath(w,position,position+outward*.12f))return outward;
         return {};
     }
-    bool flipArc{};
     Vec actionPoint(float phase) const {
+        if(authoredPath(actionMotion)) {
+            const auto point=authoredMotionPoint(actionMotion,actionFrom,actionTo,actionLandingNormal,phase);
+            if(!detour)return point;
+            const float along=authoredPathProgress(actionMotion,phase);
+            return legacyActionPoint(std::clamp(along,0.f,1.f))+point-(actionFrom+(actionTo-actionFrom)*along);
+        }
+        return legacyActionPoint(phase);
+    }
+    Vec legacyActionPoint(float phase) const {
         if(threepeatHop(actionMotion))return threepeatHopPoint(actionMotion,actionFrom,actionTo,phase);
         if(actionMotion==Motion::backFlipOut)return backFlipExitPoint(actionFrom,actionLandingNormal,phase);
         if(actionMotion==Motion::dropBack) {
@@ -1240,7 +1796,45 @@ private:
         }
         return hopMotion(actionMotion)?hopPoint(phase):lerp(actionFrom,actionTo,phase);
     }
-    bool checkedBackFlip(World& w) const {
+    bool authoredActionClear(World& world,bool roofPathChecked=false) const {
+        if(roofPathChecked&&(horizontal(actionStartSurface)-normal).length()<=.00001f&&
+            (horizontal(actionTargetSurface)-normal).length()<=.00001f&&(actionLandingNormal-normal).length()<=.00001f)return true;
+        AuthoredQueryWorld w(world);
+        Vec previous=actionFrom;float phase=0;
+        while(phase<1) {
+            const float next=authoredMotion(actionMotion).trajectory.nextPhase(phase,std::min(1.f,phase+1.f/32));
+            const auto point=actionPoint(next);
+            const Vec sourceNormal=roofTransfer||supportRecoveryAction?roofFacing(phase):normal;
+            const Vec targetNormal=next>=1&&hopMotion(actionMotion)?actionLandingNormal:roofTransfer||supportRecoveryAction?roofFacing(next):normal;
+            if(!clearPath(w,previous,point,false,targetNormal,sourceNormal,roofPathChecked)||(roofTransfer&&!roofPathChecked&&!roofPathClear(w,previous,point))||
+                (actionMotion==Motion::backFlipOut&&!w.actionBodyPathClear(actionMotion,previous,point,phase,next,actionLandingNormal,actionPoint((phase+next)*.5f)))||
+                (actionMotion>=Motion::kickUp&&actionMotion<=Motion::kickRight&&!kickClearance(w,point))) {
+                authoredQueryBudgetExhausted|=w.exhausted;return false;
+            }
+            previous=point;phase=next;
+        }
+        authoredQueryBudgetExhausted|=w.exhausted;return !w.exhausted;
+    }
+    bool checkAuthoredAction(World& w) {
+        if(authoredActionChecked)return true;
+        authoredActionChecked=authoredActionClear(w);return authoredActionChecked;
+    }
+    bool checkedBackFlip(World& w) {
+        if(authored(Motion::backFlipOut)) {
+            AuthoredQueryWorld bounded(w);
+            const auto to=backFlipExitPoint(position,normal,1);Vec previous=position;float phase=0;
+            auto path=[&](float p){return authoredPath(Motion::backFlipOut)?authoredMotionPoint(Motion::backFlipOut,position,to,normal,p):backFlipExitPoint(position,normal,p);};
+            while(phase<1) {
+                const float next=authoredMotion(Motion::backFlipOut).trajectory.nextPhase(phase,std::min(1.f,phase+1.f/32));
+                const auto target=path(next);
+                if(!clearPath(bounded,previous,target)||!bounded.actionBodyPathClear(Motion::backFlipOut,previous,target,phase,next,normal,path((phase+next)*.5f))) {
+                    authoredQueryBudgetExhausted|=bounded.exhausted;return false;
+                }
+                previous=target;phase=next;
+            }
+            authoredQueryBudgetExhausted|=bounded.exhausted;
+            authoredBackFlipPrechecked=!bounded.exhausted;return authoredBackFlipPrechecked;
+        }
         Vec previous=position;float previousPhase=0;
         for(int knot=1;knot<=backFlipExitSegments;++knot) {
             const float phase=float(knot)/backFlipExitSegments;const auto target=backFlipExitPoint(position,normal,phase);
@@ -1250,7 +1844,7 @@ private:
         return true;
     }
     Vec checkedBackFlipAbortVelocity(World& w) const {
-        const auto tangent=backFlipExitTangent(actionLandingNormal,actionTime);
+        const auto tangent=authored(actionMotion)?(actionPoint(std::min(1.f,actionTime+.001f))-actionPoint(std::max(0.f,actionTime-.001f)))/(actionSeconds*.002f):backFlipExitTangent(actionLandingNormal,actionTime);
 
         for(float fraction:{1.f,.5f,.25f}) {
             const auto target=position+tangent*(.08f*fraction);
@@ -1261,8 +1855,7 @@ private:
     }
     Vec hopPoint(float phase) const {
 
-        const float arc=flipArc?(phase<.25f?ease(phase/.25f):phase>.75f?ease((1-phase)/.25f):1.f):
-            std::pow(std::sin(3.14159265f*phase),2.f);
+        const float arc=std::pow(std::sin(3.14159265f*phase),2.f);
         return actionFrom+(actionTo-actionFrom)*hopAlongPhase(phase)+normal*(hopDistance*arc)+Vec{0,0,12*arc};
     }
     float hopAlongPhase(float phase) const {
@@ -1285,18 +1878,6 @@ private:
         }
         return true;
     }
-    bool flipClearance(World& w,Vec feet) const {
-
-        const float extent=std::max(108.f,cfg.height*.85f);
-        const Vec c=feet+Vec{0,0,cfg.height*.5f};
-        auto blocked=[&](Vec a,Vec b){return w.ray(a,b).has_value()||w.ray(b,a).has_value();};
-        for(float a:{-extent,0.f,extent})for(float b:{-extent,0.f,extent}) {
-            if(blocked(c+Vec{a,b,-extent},c+Vec{a,b,extent})||
-               blocked(c+Vec{a,-extent,b},c+Vec{a,extent,b})||
-               blocked(c+Vec{-extent,a,b},c+Vec{extent,a,b}))return false;
-        }
-        return true;
-    }
     bool kickClearance(World& w,Vec feet) const {
 
         const auto plane=surfaceNormal.unit();const Vec side{-normal.y,normal.x,0};
@@ -1315,22 +1896,31 @@ private:
         }
         return true;
     }
-    bool checkedHop(World& w,Vec from,Vec to,float outward,bool fancy=false) {
+    bool checkedHop(World& w,Vec from,Vec to,float outward,Motion selected=Motion::none,Vec landing={}) {
+        if(landing.length()<.5f)landing=normal;
+        if(authoredPath(selected)) {
+            Vec previous=from;float phase=0;
+            while(phase<1) {
+                phase=authoredMotion(selected).trajectory.nextPhase(phase,std::min(1.f,phase+1.f/32));
+                const auto point=authoredMotionPoint(selected,from,to,normal,phase);
+                if(!clearPath(w,previous,point,false,phase>=1?landing:normal)||(running&&!kickClearance(w,point)))return false;
+                previous=point;
+            }
+            hopDistance=outward;return true;
+        }
 
         const auto oldFrom=actionFrom,oldTo=actionTo;const float oldDistance=hopDistance,oldSeconds=actionSeconds;
-        const bool oldArc=flipArc,oldRunning=actionBeganRunning;
-        actionFrom=from;actionTo=to;hopDistance=outward;flipArc=fancy;
+        const bool oldRunning=actionBeganRunning;
+        actionFrom=from;actionTo=to;hopDistance=outward;
 
-        actionBeganRunning=running||runMotion(stableMotion);actionSeconds=jumpActionSeconds(running,fancy);
+        actionBeganRunning=running||runMotion(stableMotion);actionSeconds=jumpActionSeconds(running);
         Vec previous=from;bool valid=true;
         for(int i=1;i<=32;++i) {
             const float phase=float(i)/32;const auto point=hopPoint(phase);
-            if(!clearPath(w,previous,point)||
-               (fancy&&phase>=.20f&&phase<=.80f&&!flipClearance(w,point))||
-               (!fancy&&running&&!kickClearance(w,point))){valid=false;break;}previous=point;
+            if(!clearPath(w,previous,point,false,phase>=1?landing:normal)||(running&&!kickClearance(w,point))){valid=false;break;}previous=point;
         }
         actionFrom=oldFrom;actionTo=oldTo;actionSeconds=oldSeconds;actionBeganRunning=oldRunning;
-        if(!valid){hopDistance=oldDistance;flipArc=oldArc;}
+        if(!valid)hopDistance=oldDistance;
         return valid;
     }
     static Vec horizontal(Vec n) { n.z=0; return n.unit(); }
@@ -1382,6 +1972,96 @@ private:
         if(phase<.60f)return lerp(from,apex,std::clamp((phase-.22f)/.38f,0.f,1.f));
         if(phase<.88f)return lerp(apex,{to.x,to.y,apex.z},(phase-.60f)/.28f);
         return lerp({to.x,to.y,apex.z},to,(phase-.88f)/.12f);
+    }
+    Vec authoredMantlePoint(float phase,Vec from,Vec to) const {
+        phase=std::clamp(phase,0.f,1.f);
+        if(phase<=0)return from;if(phase>=1)return to;
+        if(mantleRoute.count) {
+            const float total=authoredMantleDistance(1);
+            return from+mantleRoute.sample(total>.001f?authoredMantleDistance(phase)/total:phase);
+        }
+        const auto& path=cfg.authoredMantleTrajectory;const float scale=std::clamp(cfg.contextScale,.5f,2.f);
+        const Vec right{-normal.y,normal.x,0};
+        const Vec source=path.sample(phase)*scale,end=path.sample(1)*scale,delta=to-from;
+        const Vec destination{delta.dot(right),delta.dot(normal*-1),delta.z};
+        const auto fit=[&](float value,float finish,float target) {
+            return std::abs(finish)>=8&&finish*target>=0?value*(target/finish):value+(target-finish)*ease(phase);
+        };
+        const Vec fitted{fit(source.x,end.x,destination.x),fit(source.y,end.y,destination.y),
+            end.z>=8.f*scale?source.z*destination.z/end.z:source.z+(destination.z-end.z)*ease(phase)};
+        return from+right*fitted.x-normal*fitted.y+Vec{0,0,fitted.z};
+    }
+    bool authoredMantleClear(World& w,Vec from,Vec) const {
+        if(mantleRoute.count) {
+            Vec previous=from;
+            for(std::uint32_t i=1;i<mantleRoute.count;++i) {
+                const Vec next=from+mantleRoute.knots[i].displacement;
+                if(!clearPath(w,previous,next,true))return false;
+                previous=next;
+            }
+            return true;
+        }
+        Vec previous=from;float phase=0;
+        while(phase<1) {
+            phase=cfg.authoredMantleTrajectory.nextPhase(phase,std::min(1.f,phase+1.f/32.f));
+            const auto next=topPathPoint(phase);
+            if(!clearPath(w,previous,next,true))return false;
+            previous=next;
+        }
+        return true;
+    }
+    float authoredMantleDistance(float phase) const {
+        const auto& path=cfg.authoredMantleTrajectory;float distance=0;
+        for(std::uint32_t i=1;i<path.count;++i) {
+            const auto& a=path.knots[i-1];const auto& b=path.knots[i];
+            if(phase<=a.phase)break;
+            distance+=(b.displacement-a.displacement).length()*std::clamp((phase-a.phase)/(b.phase-a.phase),0.f,1.f);
+        }
+        return distance;
+    }
+    float authoredMantleNextPhase(float phase,float limit) const {
+        const auto& path=cfg.authoredMantleTrajectory;limit=path.nextPhase(phase,limit);
+        if(!mantleRoute.count)return limit;
+        const float total=authoredMantleDistance(1);if(total<=.001f)return limit;
+        const float progress=authoredMantleDistance(phase)/total;
+        const float next=mantleRoute.nextPhase(progress,1),target=next*total;float distance=0;
+        for(std::uint32_t i=1;i<path.count;++i) {
+            const auto& a=path.knots[i-1];const auto& b=path.knots[i];
+            const float segment=(b.displacement-a.displacement).length();
+            if(segment>.00001f&&target<=distance+segment) {
+                const float crossing=a.phase+(b.phase-a.phase)*std::clamp((target-distance)/segment,0.f,1.f);
+                if(crossing>phase+.000001f)limit=std::min(limit,crossing);
+                break;
+            }
+            distance+=segment;
+        }
+        return limit;
+    }
+    bool selectAuthoredMantlePath(World& world) {
+        AuthoredQueryWorld w(world,12288);
+        mantleRoute={};
+        if(authoredMantleClear(w,mantleFrom,mantleTo)&&!w.exhausted)return true;
+        if(w.exhausted){authoredQueryBudgetExhausted=true;return false;}
+        if(!authoredPath(Motion::contextMantle))return false;
+        mantleRoute.count=1;
+        for(unsigned i=1;i<=64;++i) {
+            const Vec point=roundedMantlePoint(float(i)/64,mantleFrom,mantleApex,mantleTo)-mantleFrom;
+            const auto& last=mantleRoute.knots[mantleRoute.count-1];const float distance=(point-last.displacement).length();
+            if(distance<.05f&&i<64)continue;
+            mantleRoute.knots[mantleRoute.count++]={last.phase+distance,point};
+        }
+        const float distance=mantleRoute.knots[mantleRoute.count-1].phase;
+        if(distance>.001f) {
+            for(std::uint32_t i=1;i<mantleRoute.count;++i)mantleRoute.knots[i].phase/=distance;
+            const auto end=mantleRoute.knots[mantleRoute.count-1];std::uint32_t kept=1;
+            for(std::uint32_t i=1;i+1<mantleRoute.count;++i)
+                if(mantleRoute.knots[i].phase-mantleRoute.knots[kept-1].phase>=.0001f&&1-mantleRoute.knots[i].phase>=.0001f)
+                    mantleRoute.knots[kept++]=mantleRoute.knots[i];
+            mantleRoute.knots[kept++]=end;mantleRoute.count=kept;
+            if(mantleRoute.valid()&&authoredMantleClear(w,mantleFrom,mantleTo)&&!w.exhausted)return true;
+        }
+        authoredQueryBudgetExhausted|=w.exhausted;
+        mantleRoute={};return false;
     }
     static Vec roundedMantlePoint(float phase,Vec from,Vec apex,Vec to) {
         const auto raw=rawMantlePoint(phase,from,apex,to);
@@ -1489,7 +2169,7 @@ private:
         if(cache->size<cache->entries.size())cache->entries[cache->size++]={p,plane,supported};
         return supported;
     }
-    std::optional<Hit> wall(World& w,Vec p,Vec forward,float reach,AttachFailure* failure=nullptr,bool tracking=false,bool checkedLowTop=false,bool prospective=false,GripSupportCache* grips=nullptr) const {
+    std::optional<Hit> wall(World& w,Vec p,Vec forward,float reach,AttachFailure* failure=nullptr,bool tracking=false,bool checkedLowTop=false,bool prospective=false,GripSupportCache* grips=nullptr,Vec expectedNormal={}) const {
         const Vec right{forward.y,-forward.x,0};
         std::optional<Hit> best;
         float bestCorrection=1e9f;
@@ -1498,6 +2178,7 @@ private:
         auto valid=[&](const Hit& hit) {
             if(!hit.climbable||!hit.normal.finite()||!hit.point.finite()||hit.normal.length()<0.5f) return false;
             const auto n=hit.normal.unit();
+            if(expectedNormal.length()>.5f&&n.dot(expectedNormal.unit())<.95f)return false;
             return n.z>=(tracking?-.45f:-.15f)&&n.z<=(tracking?std::max(.94f,cfg.maxNormalZ):cfg.maxNormalZ)&&horizontal(n).dot(forward)<(tracking?-.35f:-.65f);
         };
 
@@ -1536,9 +2217,9 @@ private:
         }
         return best;
     }
-    std::optional<Hit> support(World& w,Vec p,Vec forward,bool checkedLowTop=false,bool prospective=false) const {
+    std::optional<Hit> support(World& w,Vec p,Vec forward,bool checkedLowTop=false,bool prospective=false,Vec expectedNormal={}) const {
         GripSupportCache grips;
-        if(auto h=wall(w,p,forward,cfg.reach,nullptr,true,checkedLowTop,prospective,&grips))return h;
+        if(auto h=wall(w,p,forward,cfg.reach,nullptr,true,checkedLowTop,prospective,&grips,expectedNormal))return h;
 
         static const auto directions=[] {
             std::array<Vec,6> values{};
@@ -1550,9 +2231,15 @@ private:
         for(const auto direction:directions) {
             const Vec f{forward.x*direction.x-forward.y*direction.y,
                 forward.x*direction.y+forward.y*direction.x,0};
-            if(auto h=wall(w,p,f,cfg.reach,nullptr,true,checkedLowTop,prospective,&grips))return h;
+            if(auto h=wall(w,p,f,cfg.reach,nullptr,true,checkedLowTop,prospective,&grips,expectedNormal))return h;
         }
         return {};
+    }
+    std::optional<Hit> recoveryLanding(World& w,Vec point,Vec expectedNormal) const {
+        const auto surface=expectedNormal.unit();
+        const auto hit=support(w,point,horizontal(surface)*-1,false,false,surface);
+        if(!hit||hit->normal.unit().dot(surface)<.95f||(offsetFromSurface(point,*hit)-point).length()>2)return {};
+        return hit;
     }
     struct Anchor {Vec position;Hit hit;};
     std::optional<Anchor> landingAnchor(World& w,Vec point,Hit hit) const {
@@ -1568,25 +2255,31 @@ private:
         return {};
     }
 
-    bool clearPath(World& w,Vec from,Vec to,bool supportedTop=false) const {
+    bool clearPath(World& w,Vec from,Vec to,bool supportedTop=false,Vec destinationNormal={},Vec sourceNormal={},bool headingOnly=false,bool targetChecked=false) const {
         if(!to.finite()) return false;
         const bool moving=(to-from).length()>.001f;
-        const auto towardWall=horizontal(normal)*-1;
+        if(sourceNormal.length()<.5f)sourceNormal=normal;
+        const auto towardWall=horizontal(sourceNormal)*-1;
         Vec travel=to-from;travel.z=0;travel=travel.unit();
         const Vec sideways{-towardWall.y,towardWall.x,0};
-        const std::array<Vec,9> offsets={Vec{},Vec{cfg.radius,0,0},Vec{-cfg.radius,0,0},
+        const bool turning=destinationNormal.length()>.5f&&(destinationNormal-sourceNormal).length()>.00001f;
+        const auto nextWall=turning?horizontal(destinationNormal)*-1:towardWall;
+        const Vec nextSide{-nextWall.y,nextWall.x,0};
+        const std::array<Vec,12> offsets={Vec{},Vec{cfg.radius,0,0},Vec{-cfg.radius,0,0},
             Vec{0,cfg.radius,0},Vec{0,-cfg.radius,0},towardWall*cfg.radius,travel*cfg.radius,
-            sideways*cfg.radius,sideways*-cfg.radius};
+            sideways*cfg.radius,sideways*-cfg.radius,nextWall*cfg.radius,nextSide*cfg.radius,nextSide*-cfg.radius};
 
         const float lowerRadius=cfg.radius<=6?cfg.radius:
             std::sqrt(std::max(0.f,2*cfg.radius*6.f-36.f));
-        for(std::size_t index=0;index<offsets.size();++index) {
-            if(index>=7&&std::abs(travel.dot(sideways))<.01f)continue;
+        std::array<bool,12> checkedOffsets{};
+        for(std::size_t index=headingOnly?5:0;index<(turning?offsets.size():9);++index) {
+            if(headingOnly&&index==6)continue;
             if(index>=5) {
                 bool duplicate=false;
-                for(std::size_t prior=0;prior<index;++prior)duplicate|=(offsets[index]-offsets[prior]).length()<.01f;
+                for(std::size_t prior=0;prior<index;++prior)duplicate|=checkedOffsets[prior]&&(offsets[index]-offsets[prior]).length()<.01f;
                 if(duplicate)continue;
             }
+            checkedOffsets[index]=true;
             const auto o=offsets[index];
             const auto lower=supportedTop?o*(lowerRadius/std::max(.01f,cfg.radius)):o;
             for(float z:{6.0f,cfg.chest,cfg.height}) {
@@ -1607,6 +2300,32 @@ private:
             }
             const Vec a=to+o+Vec{0,0,supportedTop?cfg.radius:6.f},b=to+o+Vec{0,0,cfg.height};
             if(auto hit=w.ray(a,b)) {blockedHit=hit;blockedFrom=a;blockedTo=b;return false;}
+            if(std::abs(o.x)>.01f&&std::abs(o.y)>.01f) {
+                const auto centre=to+Vec{0,0,std::clamp(cfg.chest,supportedTop?cfg.radius:6.f,cfg.height)};
+                const auto edge=centre+o;
+                if(auto hit=w.ray(centre,edge)) {blockedHit=hit;blockedFrom=centre;blockedTo=edge;return false;}
+            }
+        }
+        if(headingOnly&&targetChecked)return true;
+        const auto centre=to+Vec{0,0,std::clamp(cfg.chest,supportedTop?cfg.radius:6.f,cfg.height)};
+        std::array<Vec,8> measured{};std::size_t measuredCount{};
+        for(const Vec axis:{Vec{1,0,0},Vec{-1,0,0},Vec{0,1,0},Vec{0,-1,0},
+            Vec{.70710678118f,.70710678118f,0},Vec{-.70710678118f,.70710678118f,0},
+            Vec{.70710678118f,-.70710678118f,0},Vec{-.70710678118f,-.70710678118f,0}}) {
+            const auto end=centre+axis*(cfg.radius*1.41421356237f);
+            const auto hit=w.ray(centre,end);if(!hit)continue;
+            if((hit->point-centre).length()<=cfg.radius) {
+                blockedHit=hit;blockedFrom=centre;blockedTo=end;return false;
+            }
+            const auto h=horizontal(hit->normal);if(h.length()<.5f)continue;
+            const float distance=(hit->point-centre).dot(h);if(std::abs(distance)>cfg.radius)continue;
+            const auto direction=h*(distance<0?-1.f:1.f);
+            bool duplicate=false;
+            for(std::size_t index=0;index<measuredCount;++index)duplicate|=measured[index].dot(direction)>.99999f;
+            if(duplicate)continue;
+            measured[measuredCount++]=direction;
+            const auto edge=centre+direction*cfg.radius;
+            if(auto obstruction=w.ray(centre,edge)) {blockedHit=obstruction;blockedFrom=centre;blockedTo=edge;return false;}
         }
         return true;
     }
@@ -1888,7 +2607,8 @@ private:
         return {};
     }
     std::optional<Ledge> findLedge(World& source,bool* reachableStandingPath=nullptr) const {
-        TopCandidateBudgetWorld<World,Vec,Hit> w(source);
+        TopCandidateBudgetWorld<World,Vec,Hit> budget(source);
+        ProbeRayCache w(budget);
         const float highZ=cfg.grip+28;
         if(reachableStandingPath)*reachableStandingPath=false;
         ledgeReason="no walkable top";
@@ -1959,9 +2679,10 @@ private:
         return {};
         };
         const auto result=searchTopCandidateLanes(cfg.radius,lane);
-        if(w.exhausted){if(reachableStandingPath)*reachableStandingPath=false;ledgeReason="top query budget exhausted";return {};}
+        if(budget.exhausted){if(reachableStandingPath)*reachableStandingPath=false;ledgeReason="top query budget exhausted";return {};}
         return result;
     }
 };
 }
+
 

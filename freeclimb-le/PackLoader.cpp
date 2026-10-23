@@ -2,7 +2,9 @@
 #include "PackLoader.h"
 #include "src/AnimationPack.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <exception>
 #include <string>
@@ -164,6 +166,175 @@ bool FC_SampleMotion(int motion, float phase, float * out)
 			o[7] = r.s.x; o[8] = r.s.y; o[9] = r.s.z;
 		}
 		return true;
+	}
+	catch(...) { return false; }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Passo 25. Funcoes copiadas da logica do SurfacePose do original (placeWall / placeGround / placeRun).
+namespace
+{
+	bool ToPose(const float * in, fc::Pose * pose)
+	{
+		const fc::Library & lib = *g_library;
+		*pose = lib.rest;
+		if(pose->size() != 99) return false;
+		for(int i = 0; i < 99; ++i)
+		{
+			const float * o = in + i * 10;
+			(*pose)[i].t = fc::Vec{ o[0], o[1], o[2] };
+			(*pose)[i].q = fc::Quat{ o[3], o[4], o[5], o[6] };
+			(*pose)[i].s = fc::Vec{ o[7], o[8], o[9] };
+		}
+		return true;
+	}
+
+	void FromPose(const fc::Pose & pose, float * out)
+	{
+		for(int i = 0; i < 99; ++i)
+		{
+			const fc::Transform & r = pose[i];
+			float * o = out + i * 10;
+			o[0] = r.t.x; o[1] = r.t.y; o[2] = r.t.z; o[3] = r.q.x; o[4] = r.q.y; o[5] = r.q.z; o[6] = r.q.w;
+			o[7] = r.s.x; o[8] = r.s.y; o[9] = r.s.z;
+		}
+	}
+
+	fc::Quat g_runOrientation;
+	fc::Motion Dir(int d) { return (d >= 20 && d <= 24) ? (fc::Motion)d : fc::Motion::none; }
+}
+
+float FC_MotionStride(int motion)
+{
+	if(!FC_BoneCount() || motion < 1 || motion > (int)fc::motionCount) return 0.0f;
+	const fc::Clip & clip = g_library->clips[motion - 1];
+	return clip.frames.size() >= 2 ? clip.stride : 0.0f;
+}
+
+float FC_MotionSecondsDir(int motion, int direction)
+{
+	try
+	{
+		if(!FC_BoneCount() || !fc::isActiveMotion((fc::Motion)motion)) return 0.0f;
+		const fc::Clip & clip = g_library->clip((fc::Motion)motion, Dir(direction));
+		return clip.frames.size() >= 2 ? clip.seconds : 0.0f;
+	}
+	catch(...) { return 0.0f; }
+}
+
+bool FC_SampleMotionDir(int motion, float phase, int direction, float * out)
+{
+	try
+	{
+		if(!out || FC_MotionSecondsDir(motion, direction) <= 0.0f) return false;
+		if(!(phase == phase)) phase = 0.0f;	// NaN
+		const fc::Pose pose = g_library->sample((fc::Motion)motion, phase, Dir(direction));
+		if(pose.size() != 99) return false;
+		FromPose(pose, out);
+		return true;
+	}
+	catch(...) { return false; }
+}
+
+bool FC_PlaceWall(float * pose990, float gap, float surfaceZ, bool feet)
+{
+	try
+	{
+		fc::Pose pose;
+		if(!pose990 || !FC_BoneCount() || !ToPose(pose990, &pose)) return false;
+
+		const float slope = std::clamp(surfaceZ, 0.0f, 0.68f);
+		const fc::Quat tilt = fc::Quat::axis({ 1, 0, 0 }, -std::asin(slope));
+		pose[0].q = tilt * pose[0].q;
+		pose[0].t = tilt.rotate(pose[0].t);
+		if(feet)
+		{
+			const float h = std::sqrt(1 - slope * slope);
+			pose[0].t = pose[0].t + fc::Vec{ 0, h, -slope } * (gap * h - 37.0f);
+		}
+		else pose[4].t.y += (gap * std::sqrt(1 - slope * slope) - 6 * slope) - 38.0f;
+
+		FromPose(pose, pose990);
+		return true;
+	}
+	catch(...) { return false; }
+}
+
+bool FC_PlaceRun(float * pose990, float gait, float dirX, float dirY, float surfaceZ, float gap, float dt, int direction, bool reset)
+{
+	try
+	{
+		fc::Pose pose;
+		if(!pose990 || !FC_BoneCount() || !ToPose(pose990, &pose)) return false;
+		const fc::Library & lib = *g_library;
+
+		if(dt < 0.0f) dt = 0.0f;
+		if(dt > 0.05f) dt = 0.05f;
+		const float z = std::clamp(std::isfinite(surfaceZ) ? surfaceZ : 0.0f, -0.15f, 0.75f);
+		const fc::Vec direction2{ dirX, dirY, 0 };
+		const bool sideways = std::fabs(dirX) > 0.1f;
+		const bool moving = std::fabs(dirX) + std::fabs(dirY) > 0.1f;
+		const fc::Vec dir = moving ? direction2 : fc::Vec{ 0, 1, 0 };
+
+		// orientacao desejada do corpo
+		fc::Quat desired;
+		if(sideways) desired = fc::sideRunFrame(z, dir).rotation;
+		else desired = fc::Quat::axis({ 1, 0, 0 }, std::acos(z)) * fc::Quat::axis({ 0, 0, 1 }, std::atan2(-dir.x, dir.y));
+		g_runOrientation = reset ? desired : fc::boundedRotation(g_runOrientation, desired, 4.1887902f * dt);
+
+		const float h = std::sqrt(1 - z * z);
+		if(sideways)
+		{
+			fc::SideRunFrame frame = fc::sideRunFrame(z, dir);
+			frame.rotation = g_runOrientation;
+			fc::placeSideRun(lib, pose, frame, -gap * h);
+			fc::applySideRunBrace(lib, pose, frame, gait, 1.0f, Dir(direction));
+		}
+		else
+		{
+			pose[0].q = g_runOrientation * pose[0].q;
+			pose[0].t = g_runOrientation.rotate(pose[0].t);
+			pose[0].t = pose[0].t + fc::Vec{ 0, h, -z } * (gap * h - 3.0f);
+		}
+
+		FromPose(pose, pose990);
+		return true;
+	}
+	catch(...) { return false; }
+}
+
+bool FC_BuildPose(int motion, float phase, int direction, int style, float gap, float dirX, float dirY, float dt, bool resetRun, float * out)
+{
+	try
+	{
+		if(!out || !FC_SampleMotionDir(motion, phase, direction, out)) return false;
+		if(!(gap == gap) || gap < 5.0f) gap = 30.0f;
+
+		switch(style)
+		{
+			case FC_STYLE_WALL:		return FC_PlaceWall(out, gap, 0.0f, false);
+			case FC_STYLE_WALLFEET:	return FC_PlaceWall(out, gap, 0.0f, true);
+			case FC_STYLE_RUN:		return FC_PlaceRun(out, phase, dirX, dirY, 0.0f, gap, dt, direction, resetRun);
+			case FC_STYLE_BACKFLIP:
+			{
+				fc::Pose pose;
+				if(!ToPose(out, &pose)) return false;
+				fc::placeBackFlipOut(*g_library, pose, 0.0f, gap, 1.0f);
+				FromPose(pose, out);
+				return true;
+			}
+			default:
+			{
+				// o personagem leva o corpo: so rotacoes; o deslocamento do centro do corpo e o da raiz ficam no repouso autoral
+				fc::Pose pose;
+				if(!ToPose(out, &pose)) return false;
+				pose[4].t = g_library->rest[4].t;
+				pose[0].t = fc::Vec{ 0, 0, 0 };
+				pose[0].q = fc::Quat{};
+				FromPose(pose, out);
+				return true;
+			}
+		}
 	}
 	catch(...) { return false; }
 }

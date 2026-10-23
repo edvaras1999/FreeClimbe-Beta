@@ -588,7 +588,7 @@ namespace
 			// liga cada osso canonico do FreeClimb a uma entrada da tabela, pelo nome (sem distinguir maiusculas).
 			// Ficam de fora os ossos que o motor controla (raiz, folhas auxiliares, equipamento, camaras).
 			int map[99];
-			const int engineOwned[] = { 0, 1, 2, 3, 42, 43, 60, 61, 62, 63, 64, 65, 66, 97, 98 };
+			const int engineOwned[] = { 0, 1, 2, 3, 33, 34, 42, 43, 60, 61, 62, 63, 64, 65, 66, 97, 98 };
 			for(int bone = 0; bone < 99; ++bone)
 			{
 				map[bone] = -1;

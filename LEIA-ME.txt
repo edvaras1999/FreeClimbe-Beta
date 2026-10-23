@@ -1,50 +1,69 @@
-FREECLIMB LE - PASSO 24b: TODAS AS FUNCOES LIGADAS (entrada por SALTO SOZINHO por padrao)
+FREECLIMB LE - PASSO 25: PARTE 2 - MOTOR DE POSE NOVO + NUCLEO DO ORIGINAL 0.5.0
 
-CORRECAO 24b: no 24 eu tinha posto como padrao a entrada do mod original (Salto+W+A+D juntos) e o Espaco
-sozinho deixou de funcionar. Agora o PADRAO e Salto sozinho, como antes. A entrada original fica
-opcional: EntryMode=1 no .ini. O log diz "ENTRY MODE" e avisa quando ignora um salto por esse motivo.
+O QUE ESTAVA MAL (diagnostico, confirmado a ler o codigo e a correr o nucleo de animacao)
+ 1. O pack 0.5.0 do Nexus tem 31 animacoes (o original tirou sprintCatch e flipUp/Left/Right). O nucleo antigo
+    exigia 35 e REJEITAVA o pack inteiro ("must provide all 35 active animation slots"). Agora o nucleo e o do
+    original (carrega as 31 sem erros).
+ 2. "O corpo fica em pe, a deslizar": as animacoes de corrida sao clips de corrida NO CHAO. O original ROTA o corpo
+    para a parede (placeRun: corrida para cima = corpo na horizontal com os pes na parede; de lado = corpo
+    inclinado com o braco de dentro apoiado). O port so aplicava rotacoes dos ossos, por isso o corpo ficava
+    direito. Agora FC_PlaceRun faz o mesmo que o original.
+ 3. "Maos dentro da parede": o original desloca o corpo (placeWall: centro do corpo +gap-38) para as palmas ficarem
+    a ~5 unidades da superficie. Sem isso, no hang as palmas ficavam a 33 unidades com a parede a 30. Agora igual.
+ 4. "Simulacao falsa / o corpo real fica em idle": o port desenhava a pose na tabela achatada DEPOIS da passagem
+    "para baixo" e ignorava as outras passagens (selecionada, rigida, transformacao). Qualquer passagem que
+    voltasse a calcular dos ossos nativos repunha o idle, e a pele/camara/armas seguiam o idle. Agora, como no
+    original, a pose e escrita nas transformacoes LOCAIS dos ossos antes de CADA passagem, e o jogo propaga.
+ 5. W+A / W+D sem Shift: o codigo escolhia "cima" e ignorava A/D. Agora o movimento e um vetor (como no original):
+    anda na diagonal; o eixo dominante escolhe o ciclo (cima/baixo/esquerda/direita); a velocidade e a combinada.
+ 6. Entradas/saidas bruscas: agora ha fusao entrada (0,14 s), troca de movimento (0,15 s) e saida (0,22 s).
+ 7. Corrida: usa as sequencias de arranque/paragem/travagem do pack (runLaunch*, runCatch, sideBrace) com a duracao
+    certa por direcao, e o ritmo do ciclo vem da distancia por ciclo (stride) do clip. sprintCatch (que deixou de
+    existir no pack) usa jumpCatch.
 
-CONTROLOS (usam as teclas do PROPRIO jogo: se mudou W/A/S/D/Shift/Espaco/Ctrl no jogo, seguem essas)
- ENTRAR NA PAREDE
-   Salto (sozinho, padrao)  ou  Salto + W + A + D juntos (EntryMode=1)  junto a uma parede  -> apanha a parede
-        a pe:  "reach" (se ja esta colado a parede) ou "jumpCatch"
-   O mesmo A MEIO DE UM SALTO perto de uma parede:  "jumpCatch" / "ledgeCatch" (se ha borda) /
-        "sprintCatch" (se estava a correr com Shift)
-   (EntryMode=0 no .ini = Salto sozinho; EntryMode=1 = Salto+W+A+D juntos, como o mod original.)
- NA PAREDE
-   W / S / A / D           sobe / desce / anda de lado
-   Shift + direcao         CORRE na parede (runUp, runLeft, runRight, diagonais), com as animacoes de
-                           arranque (runLaunch*) e de paragem (runCatch)
-   Salto + W/A/D           salta para cima / esquerda / direita
-   Salto + S               empurra-se para longe (backFlipOut, cambalhota para tras)
-   A + S + D + Salto       larga no sitio (animacao drop)
-   Agachar                 larga (extra desta versao)
-   Chegar ao topo          passa POR CIMA da borda (contextMantle), com a camara e armas a acompanhar
-   Fim da parede de lado   canto exterior/interior: da a volta; sem canto mas com outra parede ao alcance
-                           de um salto: SALTA SOZINHO para ela (contextHopLeft/Right)
+O QUE FOI VERIFICADO AQUI (sem o jogo)
+ - Nucleo: carrega o pack 0.5.0 (31/31) e todas as animacoes amostram sem valores invalidos.
+ - Colocacao: hang com placeWall -> palmas a 25,3 (parede a 30); runUp -> cabeca a 86 unidades "para tras", pes
+   na parede; runLeft/Right/diagonais -> corpo inclinado com os pes a ~30.
+ - Motor: com um esqueleto simulado (mistura de nos e entradas), a escrita dos locais reproduz a pose autoral
+   com erro 0,0000 em hang, subir, runUp, runLeft, diagonal e jumpCatch; as passagens repetidas no mesmo quadro
+   sao idempotentes; fusao de entrada, troca e saida funcionam.
+ - Compilacao com MinGW 32 bits: SceneHooks.cpp e Gameplay.cpp compilam sem erros.
+ O QUE SO O JOGO PODE CONFIRMAR: se o motor do Skyrim LE 1.9.32 aceita a escrita nos locais como no SE (e eu
+ acho que sim: as mesmas 16 interceptacoes, a mesma estrutura). Por isso o log agora diz tudo (ver abaixo) e
+ ha PoseMode=0 no .ini para voltar ao modo antigo sem recompilar.
 
-NOVO NO .ini (copie de novo o FreeClimbLE.ini): EntryMode, AirReach, WallRunSpeed, WallRunDiagonal,
- ContextHops, CatchSpeed. Todos relidos a cada vez que se agarra: afine sem recompilar.
+COMO INSTALAR
+ 1. GitHub: arraste a pasta "freeclimb-le" > Commit; Actions > Run workflow; baixe a FreeClimbLE.dll.
+ 2. Use o PACK 0.5.0 do Nexus (o mesmo que enviou: meshes\actors\character\animations\FreeClimb\). Com o
+    pack antigo de 35 animacoes ja NAO funciona (o nucleo novo exige o pack 0.5.0 de 31).
+ 3. Copie o novo FreeClimbLE.ini (tem chaves novas: PoseMode, EntryBlend, ExitBlend, MotionBlend, RunHeight).
+ 4. Carregue o save e espere ~1 minuto.
 
-CORRECAO: a recusa de agarrar "obstaculo a altura dos joelhos" era rigorosa de mais (entulho e declives
- na base das paredes). Agora so conta um obstaculo tipo parede claramente antes da parede.
+O QUE PROCURAR NO LOG (FreeClimbLE.log)
+ "animation pack: ACCEPTED - loaded 31"      -> o pack 0.5.0 foi aceite (se disser REJECTED, copie a linha "error:").
+ "pose engine: N of 99 canonical bones ..."  -> N deve ser ~80-82 (99 menos os 17 que o motor controla).
+                                                Se for muito menor, os nomes dos ossos nao batem.
+ "pose: mode 1, weight ..., passes posed (down/sel/rigid/transform/world): a/b/c/d/e | overwritten ... a/b/c/d/e"
+   - uma linha por segundo enquanto esta agarrado. "passes posed" diz em que passagens a pose foi escrita.
+   - "overwritten" = vezes que o jogo reescreveu os ossos DEPOIS da nossa escrita, na mesma passagem. Deve ser 0.
+     Se for alto, o jogo esta a pisar a pose e eu preciso desse numero para a proxima correcao.
+ "WARNING - could not build a pose for motion N" -> uma animacao do pack nao amostrou.
 
-AINDA NAO LIGADO (e porque):
- - Stamina: o Freerun LE nao tem as funcoes de stamina verificadas; fica para um passo proprio.
- - Manipulo analogico (comando): so teclado/rato por agora; os botoes do comando que o jogo mapeia
-   para Salto/Sprint/Agachar ja funcionam, mas o stick de movimento nao e lido.
- - Pontapes e cambalhotas por cima de obstaculos durante a corrida (kickUp/kickLeft/kickRight, flip*).
- - Menu de opcoes dentro do jogo: o .ini faz esse papel.
- - As 5 atualizacoes mais recentes do mod original (compatibilidade de esqueletos, estabilidade na parede).
+TESTES (por ordem; diga-me o que falha, de forma simples, e envie o FreeClimbLE.log)
+ a) Agarrar e ficar parado (hang): as maos tocam a parede? O corpo segue a pose (nao fica em idle)?
+ b) W, S, A, D: o ciclo e natural? E W+A, W+D (agora devem andar na diagonal)?
+ c) Shift + W: o corpo deve ficar DEITADO, de pes na parede (como no video do original). Shift + A / D: corpo
+    inclinado a correr de lado. Soltar o Shift: paragem suave (runCatch). Se o corpo ficar demasiado baixo ou
+    alto, use RunHeight no .ini.
+ d) Largar (S+Salto, A+S+D+Salto, Agachar): a pose desvanece-se em ~0,2 s em vez de saltar para idle.
+ e) Se algo estiver muito mal, ponha PoseMode=0 e repita: diz-me se o modo antigo se comporta de outro jeito.
 
-COMO FAZER (igual aos passos anteriores)
- GitHub: arraste a pasta "freeclimb-le" > Commit; Actions > Run workflow; baixe o resultado; troque a
- FreeClimbLE.dll; copie o FreeClimbLE.ini. Carregue o save e espere ~1 minuto.
+CONTROLOS (iguais ao passo 24b)
+ Salto junto a uma parede -> apanha. W/S/A/D sobe/desce/anda de lado (+ diagonais). Shift+direcao corre.
+ Salto+W/A/D salta; Salto+S cambalhota para tras; A+S+D+Salto larga; Agachar larga; topo: passa a borda.
 
-TESTES (por ordem; diga-me o que falha, de forma simples)
- a) Entrar: Espaco junto a uma parede, a pe. Apanha? (reach/jumpCatch)
- b) Entrar no ar: salte para uma parede e carregue Espaco outra vez no ar. Apanha? Com Shift (sprintCatch)?
- c) Correr na parede: segure Shift + W, + A, + D, + W+A, + W+D. Anda a boa velocidade? Animacao certa?
- d) Largar: S+Salto (cambalhota para tras), A+S+D+Salto (no sitio), Agachar.
- e) Saltos contextuais: ande de lado ate ao fim de uma parede com outra ao alcance (dois pilares).
- Envie o FreeClimbLE.log.
+AINDA NAO LIGADO
+ - A parte do original que MEDE a superficie com raios para ajustar as palmas/pes (SurfacePose completo, apoio do
+   braco de dentro na corrida de lado, ajuste a bordas). A colocacao actual e a "base" do original, sem essa medicao.
+ - Pontapes (kickUp/Left/Right), stamina, manipulo analogico, menu no jogo.
