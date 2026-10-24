@@ -46,6 +46,8 @@ namespace
 		float	wallRunSpeed, wallRunDiag;	// corrida na parede (Shift) e multiplicador na diagonal
 		int		contextHops;	// 1 = salta sozinho para a parede seguinte quando a atual acaba a andar de lado
 		float	catchSpeed;		// multiplica a velocidade da animacao de apanhar a parede
+		float	speedScale, startSpeed, rampSeconds;	// velocidade pelo clip: multiplicador global, fracao no arranque, duracao da rampa
+		float	turnSmooth, turnSpeed, posSmooth;		// suavizacao: rotacao (s e graus/s) e posicao (s)
 		int		poseMode;		// 1 = pose escrita nos locais ANTES da passagem do motor (como o original); 0 = modo antigo
 		float	entryBlend, exitBlend, motionBlend;	// fusoes (segundos): entrar na pose, sair dela, trocar de movimento
 		float	runHeight;		// sobe/desce o corpo durante a corrida na parede (unidades)
@@ -55,7 +57,9 @@ namespace
 	void DefaultConfig()
 	{
 		g_cfg.reach = 110.0f;	g_cfg.gap = 30.0f;
-		g_cfg.climbSpeed = 100.0f;	g_cfg.downSpeed = 78.0f;	g_cfg.sideSpeed = 82.0f;		// os padroes do FreeClimb original
+		g_cfg.climbSpeed = 0.0f;	g_cfg.downSpeed = 0.0f;	g_cfg.sideSpeed = 0.0f;		// 0 = automatico: a velocidade do proprio clip (distancia por ciclo / duracao)
+		g_cfg.speedScale = 1.0f;	g_cfg.startSpeed = 0.45f;	g_cfg.rampSeconds = 0.7f;
+		g_cfg.turnSmooth = 0.15f;	g_cfg.turnSpeed = 540.0f;	g_cfg.posSmooth = 0.10f;
 		g_cfg.minLedge = 80.0f;	g_cfg.maxLedge = 180.0f;
 		g_cfg.headHeight = 125.0f;
 		g_cfg.alwaysCling = 1;
@@ -140,6 +144,12 @@ namespace
 			else if(KeyIs(key, "ContextHops"))	g_cfg.contextHops = atoi(value.c_str());
 			else if(KeyIs(key, "CatchSpeed"))	g_cfg.catchSpeed = f;
 			else if(KeyIs(key, "PoseMode"))	g_cfg.poseMode = atoi(value.c_str());
+			else if(KeyIs(key, "SpeedScale"))	g_cfg.speedScale = f;
+			else if(KeyIs(key, "StartSpeed"))	g_cfg.startSpeed = f;
+			else if(KeyIs(key, "RampSeconds"))	g_cfg.rampSeconds = f;
+			else if(KeyIs(key, "TurnSmooth"))	g_cfg.turnSmooth = f;
+			else if(KeyIs(key, "TurnSpeed"))	g_cfg.turnSpeed = f;
+			else if(KeyIs(key, "PosSmooth"))	g_cfg.posSmooth = f;
 			else if(KeyIs(key, "EntryBlend"))	g_cfg.entryBlend = f;
 			else if(KeyIs(key, "ExitBlend"))	g_cfg.exitBlend = f;
 			else if(KeyIs(key, "MotionBlend"))	g_cfg.motionBlend = f;
@@ -147,6 +157,8 @@ namespace
 		}
 
 		SceneHooksConfigure(g_cfg.poseMode, g_cfg.entryBlend, g_cfg.exitBlend);
+		_MESSAGE("gameplay: speeds (0 = clip speed): up/down/side %.0f/%.0f/%.0f, scale %.2f, start %.2f over %.2f s | smoothing: turn %.2f s (max %.0f deg/s), position %.2f s",
+				 (double)g_cfg.climbSpeed, (double)g_cfg.downSpeed, (double)g_cfg.sideSpeed, (double)g_cfg.speedScale, (double)g_cfg.startSpeed, (double)g_cfg.rampSeconds, (double)g_cfg.turnSmooth, (double)g_cfg.turnSpeed, (double)g_cfg.posSmooth);
 		_MESSAGE("gameplay: pose engine: mode %d (%s), blend in/out/motion %.2f/%.2f/%.2f s, run height %.0f", g_cfg.poseMode, g_cfg.poseMode ? "locals before the engine pass" : "OLD: world after the pass", (double)g_cfg.entryBlend, (double)g_cfg.exitBlend, (double)g_cfg.motionBlend, (double)g_cfg.runHeight);
 		_MESSAGE("gameplay: settings: reach %.0f, wall gap %.0f, speeds up/down/side %.0f/%.0f/%.0f, ledge %.0f-%.0f, head %.0f, alwaysCling %d, faceWall %d, hop scale/speed %.2f/%.2f, attach reach %.0f, ease %d, warp %d, ENTRY MODE %d (%s)",
 				 (double)g_cfg.reach, (double)g_cfg.gap, (double)g_cfg.climbSpeed, (double)g_cfg.downSpeed, (double)g_cfg.sideSpeed,
@@ -171,7 +183,87 @@ namespace
 
 	volatile LONG	g_state = kIdle;
 	DWORD			g_lastTick = 0, g_attachTime = 0;
-	float			g_pos[3];			// pes do personagem enquanto agarrado
+	float			g_pos[3];			// pes do personagem enquanto agarrado (posicao LOGICA)
+
+	// ---- passo A: suavizacao visual ----
+	// A logica (g_pos, g_n) continua a ser exata; o que se MOSTRA segue-a com um desvio que desvanece sem ressalto.
+	// Assim nao ha atraso a andar em linha reta, e os saltos (cantos, facetas de arvores/pilares) deixam de ser teleportes.
+	float			g_off[2] = { 0.0f, 0.0f }, g_offVel[2] = { 0.0f, 0.0f };
+	float			g_yawOff = 0.0f, g_yawOffVel = 0.0f, g_prevGoalYaw = 0.0f;
+	bool			g_yawInit = false, g_prevGoalValid = false;
+	float			g_moveT = 0.0f;
+	LONGLONG		g_qpcLast = 0, g_qpcFaceLast = 0, g_qpcViewLast = 0;
+
+	float QpcSeconds(LONGLONG * last)
+	{
+		LARGE_INTEGER f, n;
+		QueryPerformanceFrequency(&f); QueryPerformanceCounter(&n);
+		float dt = (*last != 0 && f.QuadPart > 0) ? (float)((double)(n.QuadPart - *last) / (double)f.QuadPart) : 0.016f;
+		*last = n.QuadPart;
+		if(!(dt > 0.0f)) dt = 0.001f;
+		if(dt > 0.1f) dt = 0.1f;
+		return dt;
+	}
+
+	float WrapPi(float a)
+	{
+		while(a > 3.14159265f) a -= 6.2831853f;
+		while(a < -3.14159265f) a += 6.2831853f;
+		return a;
+	}
+
+	// Faz 'cur' tender para 0 como uma mola criticamente amortecida (sem ressalto), com velocidade maxima.
+	float DecayToZero(float cur, float * vel, float smoothTime, float maxSpeed, float dt)
+	{
+		if(smoothTime < 0.0001f) { *vel = 0.0f; return 0.0f; }
+		const float omega = 2.0f / smoothTime, x = omega * dt;
+		const float e = 1.0f / (1.0f + x + 0.48f * x * x + 0.235f * x * x * x);
+		float change = cur;
+		const float maxChange = maxSpeed * smoothTime;
+		if(change > maxChange) change = maxChange;
+		if(change < -maxChange) change = -maxChange;
+		const float target = cur - change;
+		const float temp = (*vel + omega * change) * dt;
+		*vel = (*vel - omega * temp) * e;
+		float out = target + (change + temp) * e;
+		if((cur > 0.0f && out < 0.0f) || (cur < 0.0f && out > 0.0f)) { out = 0.0f; *vel = 0.0f; }
+		return out;
+	}
+
+	void ResetSmooth()
+	{
+		g_off[0] = g_off[1] = g_offVel[0] = g_offVel[1] = 0.0f;
+		g_yawOff = g_yawOffVel = 0.0f;
+		g_yawInit = false; g_prevGoalValid = false;
+		g_qpcFaceLast = g_qpcViewLast = 0;
+	}
+
+	// Poe a posicao logica num novo sitio. Se foi um salto (canto, faceta), o que se mostra continua onde estava e vai ate la suavemente.
+	void SnapPos(float x, float y)
+	{
+		const float dx = g_pos[0] - x, dy = g_pos[1] - y;
+		if(g_cfg.posSmooth > 0.001f && dx * dx + dy * dy > 1.5f * 1.5f)
+		{
+			g_off[0] += dx; g_off[1] += dy;
+			const float len = sqrtf(g_off[0] * g_off[0] + g_off[1] * g_off[1]);
+			if(len > 90.0f) { g_off[0] *= 90.0f / len; g_off[1] *= 90.0f / len; }
+		}
+		g_pos[0] = x; g_pos[1] = y;
+	}
+
+	// Antes de uma transicao que usa g_pos como ponto de partida: o que se ve passa a ser a posicao logica.
+	void CommitView()
+	{
+		g_pos[0] += g_off[0]; g_pos[1] += g_off[1];
+		g_off[0] = g_off[1] = g_offVel[0] = g_offVel[1] = 0.0f;
+	}
+
+	// Velocidade natural de um clip (unidades/s): distancia por ciclo / duracao.
+	float NaturalSpeed(int motion, float fallback)
+	{
+		const float stride = FC_MotionStride(motion), secs = FC_MotionSeconds(motion);
+		return (stride > 1.0f && secs > 0.05f) ? stride / secs : fallback;
+	}
 	float			g_n[2];				// normal da parede (aponta da parede para o personagem)
 	float			g_phase = 0.0f;
 	int				g_motion = kHang;
@@ -332,14 +424,53 @@ namespace
 		out->wallDistance = wall.dist;
 		out->height = height;
 		out->topZ = top.hitPosition.z;
+
+		// diagnostico das bordas: o que e esta "borda"? (se subir para algo invisivel, esta linha diz que colisao e)
+		_MESSAGE("gameplay: ledge accepted - height %.0f above the feet (top z %.1f at %.0f, %.0f), wall distance %.0f, top surface: collision layer %u, %s, form type %u, normal.z %.2f",
+				 (double)height, (double)top.hitPosition.z, (double)top.hitPosition.x, (double)top.hitPosition.y, (double)wall.dist,
+				 (unsigned)top.layer, top.hasReference ? "belongs to a placed object" : "NO placed object (terrain or loose collision)", (unsigned)top.formType, (double)top.normal.z);
 		return true;
 	}
 
 	// ------------------------------------------------------------------ passar por cima da borda
 	// O personagem MOVE-SE mesmo ao longo do caminho da animacao (a camara e as armas acompanham-no) e, no fim,
 	// ja esta em cima da borda: nao ha "salto" de posicao. O desenho do corpo usa so as rotacoes do clipe.
+	// Vira o personagem para a parede, com arranque e travagem suaves (TurnSmooth/TurnSpeed no .ini).
+	void ApplyFacing(Actor * player)
+	{
+		if(!g_cfg.faceWall) return;
+		const float goal = atan2f(-g_n[0], -g_n[1]);
+		float & yaw = Engine::Rotation(player).z;
+		if(g_cfg.turnSmooth <= 0.001f) { yaw = goal; g_yawOff = 0.0f; g_yawInit = true; g_prevGoalYaw = goal; g_prevGoalValid = true; return; }
+
+		const float dt = QpcSeconds(&g_qpcFaceLast);
+		if(!g_yawInit) { g_yawOff = WrapPi(yaw - goal); g_yawOffVel = 0.0f; g_yawInit = true; }
+		else if(g_prevGoalValid)
+		{
+			const float jump = WrapPi(goal - g_prevGoalYaw);
+			if(fabsf(jump) > 0.07f) g_yawOff -= jump;		// a normal deu um salto (canto/faceta): o corpo nao teleporta, desvanece
+		}
+		g_prevGoalYaw = goal; g_prevGoalValid = true;
+		g_yawOff = DecayToZero(g_yawOff, &g_yawOffVel, g_cfg.turnSmooth, g_cfg.turnSpeed * 0.0174533f, dt);
+		yaw = WrapPi(goal + g_yawOff);
+	}
+
+	// Poe o controlador onde o personagem se MOSTRA: a posicao logica mais o desvio que desvanece.
+	void PlaceView(void * ctrl)
+	{
+		if(g_cfg.posSmooth > 0.001f)
+		{
+			const float dt = QpcSeconds(&g_qpcViewLast);
+			g_off[0] = DecayToZero(g_off[0], &g_offVel[0], g_cfg.posSmooth, 700.0f, dt);
+			g_off[1] = DecayToZero(g_off[1], &g_offVel[1], g_cfg.posSmooth, 700.0f, dt);
+		}
+		else g_off[0] = g_off[1] = 0.0f;
+		PlaceController(ctrl, g_pos[0] + g_off[0], g_pos[1] + g_off[1], g_pos[2]);
+	}
+
 	void FinishMantle()
 	{
+		ResetSmooth();
 		Actor * player = ThePlayer();
 		void * ctrl = player ? Engine::CharController(player) : NULL;
 		if(ctrl) PlaceController(ctrl, g_destX, g_destY, g_destZ + 1.0f);
@@ -363,6 +494,7 @@ namespace
 	// Comeca a passar por cima da borda a partir do ponto (px,py,pz), virado para (fx,fy).
 	bool StartMantle(Actor * player, float fx, float fy, float px, float py, float pz, const char ** reason)
 	{
+		CommitView();
 		Ledge ledge;
 		if(!FindLedge(player, fx, fy, px, py, pz, &ledge, reason)) return false;
 
@@ -390,6 +522,8 @@ namespace
 	// ------------------------------------------------------------------ agarrar-se a parede
 	void Release(const char * why, float pushSpeed = 60.0f)
 	{
+		CommitView();
+		ResetSmooth();
 		Actor * player = ThePlayer();
 		void * ctrl = player ? Engine::CharController(player) : NULL;
 		if(ctrl)
@@ -430,9 +564,8 @@ namespace
 		}
 
 		g_n[0] = w.nx; g_n[1] = w.ny;
-		g_pos[0] = w.x + g_n[0] * g_cfg.gap;
-		g_pos[1] = w.y + g_n[1] * g_cfg.gap;
-		PlaceController(ctrl, g_pos[0], g_pos[1], g_pos[2]);
+		SnapPos(w.x + g_n[0] * g_cfg.gap, w.y + g_n[1] * g_cfg.gap);
+		PlaceView(ctrl);
 		EnterCling();
 	}
 
@@ -448,6 +581,7 @@ namespace
 		g_catchMotion = motion;
 		g_catchSecs = (secs > 0.0f ? secs : 0.1f) / (g_cfg.catchSpeed > 0.2f ? g_cfg.catchSpeed : 1.0f);
 		g_catchStart = g_lastTick = GetTickCount();
+		ResetSmooth();
 		g_pos[0] = fromX; g_pos[1] = fromY; g_pos[2] = fromZ;
 
 		g_in.jumpEdge = 0; g_in.sneakEdge = 0;
@@ -462,7 +596,7 @@ namespace
 		const float e = p * p * (3.0f - 2.0f * p);
 		for(int k = 0; k < 3; ++k) g_pos[k] = g_catchFrom[k] + (g_catchTo[k] - g_catchFrom[k]) * e;
 
-		if(g_cfg.faceWall) Engine::Rotation(player).z = atan2f(-g_n[0], -g_n[1]);
+		ApplyFacing(player);
 		PlaceController(ctrl, g_pos[0], g_pos[1], g_pos[2]);
 		Show(g_catchMotion, p, 0, FC_STYLE_BODY);
 		if(p >= 1.0f) LandOnWall(player, ctrl, false);
@@ -517,6 +651,7 @@ namespace
 	// 'context' = salto automatico entre paredes: o centro do corpo nao e deslocado pela animacao (o personagem move-se mesmo).
 	void StartHop(int motion, float lateral, float vertical, bool context = false)
 	{
+		CommitView();
 		const float secs = FC_MotionSeconds(motion);
 		if(secs <= 0.0f) { Release("hop animation not available"); return; }
 
@@ -561,7 +696,7 @@ namespace
 		const float e = g_cfg.hopEase ? p * p * (3.0f - 2.0f * p) : p;			// suave no inicio e no fim (ou constante)
 
 		for(int k = 0; k < 3; ++k) g_pos[k] = g_hopFrom[k] + (g_hopTo[k] - g_hopFrom[k]) * e;
-		if(g_cfg.faceWall) Engine::Rotation(player).z = atan2f(-g_n[0], -g_n[1]);
+		ApplyFacing(player);
 		PlaceController(ctrl, g_pos[0], g_pos[1], g_pos[2]);
 		Show(g_hopMotion, p, 0, g_hopCom > 0.5f ? FC_STYLE_WALL : FC_STYLE_BODY);
 		if(p >= 1.0f) { _MESSAGE("gameplay: hop landing"); LandOnWall(player, ctrl, g_hopMotion == kHopUp); }
@@ -602,12 +737,12 @@ namespace
 		if(SceneHooksPoseFaulted()) { Release("the skeleton was rebuilt by the game"); return; }
 
 		const DWORD now = GetTickCount();
+		const float frameDt = QpcSeconds(&g_qpcLast);		// relogio de alta resolucao: o GetTickCount tem ~15 ms de grao e faz o movimento tremer
 		if(g_state == kTopOut) { g_lastTick = now; TickMantle(ctrl, now); return; }
 		if(g_state == kHop) { g_lastTick = now; TickHop(player, ctrl, now); return; }
 		if(g_state == kCatch) { g_lastTick = now; TickCatch(player, ctrl, now); return; }
 
-		float dt = (float)(now - g_lastTick) / 1000.0f;
-		if(dt > 0.1f) dt = 0.1f;
+		const float dt = frameDt;
 		g_lastTick = now;
 
 		// soltar: salto ou agachar (ignora a pressao que acabou de nos agarrar)
@@ -649,10 +784,25 @@ namespace
 		const float mode = g_runBlend * g_runBlend * (3.0f - 2.0f * g_runBlend);
 		const bool diagonal = fabsf(ix) > 0.1f && fabsf(iy) > 0.1f;
 		const float runSp = g_cfg.wallRunSpeed * (diagonal ? g_cfg.wallRunDiag : 1.0f);
-		const float vertical = iy > 0.0f ? g_cfg.climbSpeed : g_cfg.downSpeed;
+		// Velocidades: por defeito as do PROPRIO CLIP (distancia por ciclo / duracao), para os pes nao patinarem e a animacao
+		// nao tocar acelerada. 0 no .ini = automatico; um valor > 0 forca essa velocidade. SpeedScale multiplica tudo.
+		const float climbV = (g_cfg.climbSpeed > 0.0f ? g_cfg.climbSpeed : NaturalSpeed(kUp, 45.2f)) * g_cfg.speedScale;
+		const float downV = (g_cfg.downSpeed > 0.0f ? g_cfg.downSpeed : NaturalSpeed(kDown, 45.2f)) * g_cfg.speedScale;
+		const float sideV = (g_cfg.sideSpeed > 0.0f ? g_cfg.sideSpeed : NaturalSpeed(kLeft, 36.2f)) * g_cfg.speedScale;
+		const float vertical = iy > 0.0f ? climbV : downV;
 
-		float vt = ix * (g_cfg.sideSpeed + (runSp - g_cfg.sideSpeed) * mode);
-		float vz = iy * (vertical + (runSp - vertical) * mode);
+		// arranque mais lento: ao comecar a mexer parte de StartSpeed e sobe suavemente ate 100% em RampSeconds
+		if(moving) g_moveT += dt; else g_moveT = 0.0f;
+		float ramp = 1.0f;
+		if(g_cfg.rampSeconds > 0.01f && g_cfg.startSpeed < 0.999f)
+		{
+			float t = g_moveT / g_cfg.rampSeconds;
+			t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+			ramp = g_cfg.startSpeed + (1.0f - g_cfg.startSpeed) * (t * t * (3.0f - 2.0f * t));
+		}
+
+		float vt = ix * (sideV + (runSp - sideV) * mode) * ramp;
+		float vz = iy * (vertical + (runSp - vertical) * mode) * ramp;
 
 		// que movimento do pacote mostrar (como o original: o eixo dominante escolhe o ciclo)
 		int motion = kHang, runDir = 0, style = FC_STYLE_WALL;
@@ -727,8 +877,7 @@ namespace
 			if(side.found)
 			{
 				g_n[0] = side.nx; g_n[1] = side.ny;
-				g_pos[0] = side.x + g_n[0] * g_cfg.gap;
-				g_pos[1] = side.y + g_n[1] * g_cfg.gap;
+				SnapPos(side.x + g_n[0] * g_cfg.gap, side.y + g_n[1] * g_cfg.gap);
 				vt = 0.0f;
 				_MESSAGE("gameplay: inner corner - switched to the next wall");
 			}
@@ -770,10 +919,9 @@ namespace
 				if(around.found)
 				{
 					g_n[0] = around.nx; g_n[1] = around.ny;
-					g_pos[0] = around.x + g_n[0] * g_cfg.gap;
-					g_pos[1] = around.y + g_n[1] * g_cfg.gap;
-					if(g_cfg.faceWall) Engine::Rotation(player).z = atan2f(-g_n[0], -g_n[1]);
-					PlaceController(ctrl, g_pos[0], g_pos[1], g_pos[2]);
+					SnapPos(around.x + g_n[0] * g_cfg.gap, around.y + g_n[1] * g_cfg.gap);
+					ApplyFacing(player);
+					PlaceView(ctrl);
 					ShowCling();
 					_MESSAGE("gameplay: outer corner - wrapped around to the next face");
 					return;
@@ -798,8 +946,7 @@ namespace
 			return;
 		}
 		g_n[0] = w.nx; g_n[1] = w.ny;
-		g_pos[0] = w.x + g_n[0] * g_cfg.gap;
-		g_pos[1] = w.y + g_n[1] * g_cfg.gap;
+		SnapPos(w.x + g_n[0] * g_cfg.gap, w.y + g_n[1] * g_cfg.gap);
 
 		// chegou ao topo? (a subir, sem parede a altura da cabeca) -> passar por cima da borda
 		if(up)
@@ -824,8 +971,8 @@ namespace
 			if(ground.didHit && ground.normal.z > 0.6f) { Release("reached the ground"); return; }
 		}
 
-		if(g_cfg.faceWall) Engine::Rotation(player).z = atan2f(-g_n[0], -g_n[1]);
-		PlaceController(ctrl, g_pos[0], g_pos[1], g_pos[2]);
+		ApplyFacing(player);
+		PlaceView(ctrl);
 		ShowCling();
 	}
 

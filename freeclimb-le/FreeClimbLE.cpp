@@ -21,7 +21,7 @@
 #include <shlobj.h>
 
 #define PLUGIN_NAME				"FreeClimbLE"
-#define PLUGIN_VERSION_STRING	"0.25.0 (passo 25: motor de pose novo + nucleo do original 0.5.0)"
+#define PLUGIN_VERSION_STRING	"0.27.0 (passo A: camara/rotacao suaves, velocidade pelo clip, arranque lento)"
 #define PLUGIN_LOG_FILE			"\\My Games\\Skyrim\\SKSE\\FreeClimbLE.log"
 
 static PluginHandle				g_pluginHandle	= kPluginHandle_Invalid;
