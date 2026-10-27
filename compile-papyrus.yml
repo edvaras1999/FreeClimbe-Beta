@@ -1,0 +1,109 @@
+name: Compilar scripts Papyrus (menu do FreeClimb)
+
+# Corre quando voce clicar em "Run workflow" ou quando mudar algo na pasta papyrus.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'papyrus/**'
+      - '.github/workflows/compile-papyrus.yml'
+
+jobs:
+  papyrus:
+    runs-on: windows-latest
+    steps:
+      - name: Baixar o repositorio
+        uses: actions/checkout@v4
+
+      - name: Obter o compilador Caprica
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ws = $env:GITHUB_WORKSPACE
+          $headers = @{ 'User-Agent' = 'freeclimb-build'; 'Authorization' = "Bearer $env:GH_TOKEN"; 'Accept' = 'application/vnd.github+json' }
+          $repos = @('Orvid/Caprica', 'russo-2025/caprica')
+          $picked = $null
+          foreach ($repo in $repos) {
+            Write-Host "=== Releases de $repo ==="
+            try { $rels = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases" -Headers $headers }
+            catch { Write-Host "Falhou: $($_.Exception.Message)"; continue }
+            foreach ($r in $rels) {
+              foreach ($a in $r.assets) {
+                Write-Host ("  {0} -> {1}" -f $r.tag_name, $a.name)
+                if (-not $picked -and $a.name -match '(?i)\.(zip|7z)$' -and $a.name -notmatch '(?i)source|linux|mac') { $picked = $a }
+              }
+            }
+            if ($picked) { break }
+          }
+          if (-not $picked) { throw 'Nao encontrei um pacote do Caprica nas releases. Veja a lista acima e me envie este log.' }
+          Write-Host "Escolhido: $($picked.name)"
+          $pkg = Join-Path $ws $picked.name
+          Invoke-WebRequest -Uri $picked.browser_download_url -OutFile $pkg -Headers @{ 'User-Agent' = 'freeclimb-build' }
+          $dest = Join-Path $ws 'caprica'
+          New-Item -ItemType Directory -Force $dest | Out-Null
+          if ($pkg -match '(?i)\.zip$') { Expand-Archive -Path $pkg -DestinationPath $dest -Force }
+          else { & "C:\Program Files\7-Zip\7z.exe" x $pkg "-o$dest" -y | Out-Null }
+          $exe = Get-ChildItem $dest -Recurse -Filter 'Caprica.exe' | Select-Object -First 1
+          if (-not $exe) { throw 'O pacote nao tem Caprica.exe.' }
+          Write-Host "Caprica: $($exe.FullName)"
+          "CAPRICA=$($exe.FullName)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Compilar os scripts
+        shell: pwsh
+        run: |
+          $ws = $env:GITHUB_WORKSPACE
+          $log = Join-Path $ws 'papyrus-build.log'
+          $out = Join-Path $ws 'out'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Set-Location $ws
+
+          # Caminhos absolutos: assim o Caprica nao mistura os nossos scripts com a pasta do repositorio.
+          $stubs = Join-Path $ws 'papyrus\stubs'
+          $src   = Join-Path $ws 'papyrus\src'
+          $flags = Join-Path $ws 'papyrus\TESV_Papyrus_Flags.flg'
+          $files = @((Join-Path $src 'FreeClimbNative.psc'), (Join-Path $src 'FreeClimbMCM.psc'))
+
+          '=== inicio ===' | Out-File $log
+
+          # Lista de tentativas (cada uma e uma lista de argumentos). As opcoes sao as da ajuda do Caprica v0.3.0.
+          $tries = New-Object System.Collections.ArrayList
+          [void]$tries.Add(@('--game', 'skyrim', '--flags', $flags, '--ignorecwd', '--import', $stubs, '--import', $src, '--output', $out) + $files)
+          [void]$tries.Add(@('--game', 'skyrim', '--flags', $flags, '--import', $stubs, '--import', $src, '--output', $out) + $files)
+          [void]$tries.Add(@('--game', 'skyrim', '--flags', $flags, '--ignorecwd', '--import', "$stubs;$src", '--output', $out) + $files)
+
+          $ok = $false
+          $n = 0
+          foreach ($t in $tries) {
+            $n++
+            "=== tentativa $n : $($t -join ' ') ===" | Out-File $log -Append
+            Get-ChildItem $out -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            & $env:CAPRICA @t 2>&1 | Tee-Object -FilePath $log -Append
+            $code = $LASTEXITCODE
+            $mcm = Get-ChildItem $out -Recurse -Filter 'FreeClimbMCM.pex' -ErrorAction SilentlyContinue | Select-Object -First 1
+            $nat = Get-ChildItem $out -Recurse -Filter 'FreeClimbNative.pex' -ErrorAction SilentlyContinue | Select-Object -First 1
+            "codigo de saida: $code ; MCM.pex: $([bool]$mcm) ; Native.pex: $([bool]$nat)" | Tee-Object -FilePath $log -Append
+            if ($code -eq 0 -and $mcm -and $nat) {
+              # Poe os dois .pex na raiz da pasta out (o Caprica pode cria-los em subpastas).
+              foreach ($f in @($mcm, $nat)) {
+                $dst = Join-Path $out $f.Name
+                if ($f.FullName -ne $dst) { Copy-Item $f.FullName $dst -Force }
+              }
+              $ok = $true
+              break
+            }
+          }
+          if (-not $ok) { Write-Host '=== TODAS AS TENTATIVAS FALHARAM (veja o artefato papyrus) ==='; exit 1 }
+          Write-Host 'Compilou.'
+          Get-ChildItem $out -Recurse | Format-Table FullName, Length
+
+      - name: Guardar o resultado
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: papyrus
+          path: |
+            out
+            papyrus-build.log
+          if-no-files-found: warn

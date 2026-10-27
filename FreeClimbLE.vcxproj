@@ -1,0 +1,194 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{7C2B5E10-4D3A-4B7E-9E61-5F0A8C1D2E33}</ProjectGuid>
+    <ProjectName>FreeClimbLE</ProjectName>
+    <RootNamespace>FreeClimbLE</RootNamespace>
+    <Keyword>Win32Proj</Keyword>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="..\..\config\_Plugins.props" />
+  </ImportGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>MultiByte</CharacterSet>
+    <UseDebugLibraries>true</UseDebugLibraries>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>MultiByte</CharacterSet>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <_ProjectFileVersion>17.0.35327.3</_ProjectFileVersion>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <LinkIncremental>true</LinkIncremental>
+    <TargetName>$(ProjectName)</TargetName>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <LinkIncremental>false</LinkIncremental>
+    <TargetName>$(ProjectName)</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <Optimization>Disabled</Optimization>
+      <AdditionalIncludeDirectories>$(SolutionDir);$(SolutionDir)\..;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>_DEBUG;WIN32;_WINDOWS;_USRDLL;PLUGIN_EXAMPLE_EXPORTS;RUNTIME;RUNTIME_VERSION=$(SeRuntimeVersion);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <DebugInformationFormat>EditAndContinue</DebugInformationFormat>
+      <ForcedIncludeFiles>common/IPrefix.h;%(ForcedIncludeFiles)</ForcedIncludeFiles>
+    </ClCompile>
+    <Link>
+      <ModuleDefinitionFile>exports.def</ModuleDefinitionFile>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <SubSystem>Windows</SubSystem>
+      <TargetMachine>MachineX86</TargetMachine>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <Optimization>MaxSpeed</Optimization>
+      <AdditionalIncludeDirectories>$(SolutionDir);$(SolutionDir)\..;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>NDEBUG;WIN32;_WINDOWS;_USRDLL;PLUGIN_EXAMPLE_EXPORTS;RUNTIME;RUNTIME_VERSION=$(SeRuntimeVersion);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <DebugInformationFormat>None</DebugInformationFormat>
+      <ForcedIncludeFiles>common/IPrefix.h;%(ForcedIncludeFiles)</ForcedIncludeFiles>
+      <!-- Trims the build directory out of __FILE__, which the SDK's assert
+           macros embed. Without it the shipped DLL carries absolute paths from
+           the machine it was built on. Set SdkTrimPrefix to the SDK root:
+           SdkTrimPrefix is the SDK root WITHOUT a trailing separator.
+             MSBuild FreeClimbLE.vcxproj /p:SdkTrimPrefix=<sdk root>\ ... -->
+      <AdditionalOptions>/d1trimfile:$(SdkTrimPrefix)\ %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <ModuleDefinitionFile>exports.def</ModuleDefinitionFile>
+      <GenerateDebugInformation>false</GenerateDebugInformation>
+      <OptimizeReferences>true</OptimizeReferences>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <SubSystem>Windows</SubSystem>
+      <TargetMachine>MachineX86</TargetMachine>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\common\common_vc9.vcxproj">
+      <Project>{20C6411C-596F-4B85-BE4E-8BC91F59D8A6}</Project>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+    </ProjectReference>
+  </ItemGroup>
+  <ItemGroup>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="FreeClimbLE.cpp" />
+    <ClCompile Include="..\..\skse\skse\SafeWrite.cpp" />
+    <ClCompile Include="..\..\skse\skse\GameAPI.cpp" />
+    <ClCompile Include="..\..\skse\skse\GameMenus.cpp" />
+    <ClCompile Include="..\..\skse\skse\GameTypes.cpp" />
+    <ClCompile Include="..\..\skse\skse\NiTypes.cpp" />
+    <ClCompile Include="..\..\skse\skse\GameInput.cpp" />
+    <ClCompile Include="..\..\skse\skse\InputMap.cpp" />
+    <ClCompile Include="..\..\skse\skse\ScaleformAPI.cpp" />
+    <ClCompile Include="..\..\skse\skse\ScaleformCallbacks.cpp" />
+    <ClCompile Include="..\..\skse\skse\ScaleformMovie.cpp" />
+    <ClCompile Include="..\..\skse\skse\PapyrusNativeFunctions.cpp" />
+    <ClCompile Include="..\..\skse\skse\PapyrusArgs.cpp" />
+    <ClCompile Include="..\..\skse\skse\PapyrusVM.cpp" />
+    <ClCompile Include="..\..\skse\skse\HashUtil.cpp" />
+    <ClCompile Include="..\..\skse\skse\Utilities.cpp" />
+    <ClCompile Include="..\..\skse\skse\GameRTTI.cpp" />
+    <ClCompile Include="Engine.cpp" />
+    <ClCompile Include="Havok.cpp" />
+    <ClCompile Include="Gameplay.cpp" />
+    <ClCompile Include="Options.cpp" />
+    <ClCompile Include="VtableScan.cpp" />
+    <ClCompile Include="RttiReport.cpp" />
+    <ClCompile Include="SceneHooks.cpp" />
+    <ClCompile Include="PackLoader.cpp">
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <ForcedIncludeFiles></ForcedIncludeFiles>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+      <PreprocessorDefinitions>NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="src\AnimationPack.cpp">
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <ForcedIncludeFiles></ForcedIncludeFiles>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+      <PreprocessorDefinitions>NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="src\AnimationOverrides.cpp">
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <ForcedIncludeFiles></ForcedIncludeFiles>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+      <PreprocessorDefinitions>NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="src\HkxAnimation.cpp">
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <ForcedIncludeFiles></ForcedIncludeFiles>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+      <PreprocessorDefinitions>NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="src\HkxSpline.cpp">
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <ForcedIncludeFiles></ForcedIncludeFiles>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+      <PreprocessorDefinitions>NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <None Include="exports.def" />
+  </ItemGroup>
+  <ItemGroup>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="Log.h" />
+    <ClInclude Include="PackLoader.h" />
+    <ClInclude Include="VtableScan.h" />
+    <ClInclude Include="RttiReport.h" />
+    <ClInclude Include="SceneHooks.h" />
+    <ClInclude Include="Engine.h" />
+    <ClInclude Include="Havok.h" />
+    <ClInclude Include="Gameplay.h" />
+    <ClInclude Include="Options.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="FreeClimbLE.rc" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>
