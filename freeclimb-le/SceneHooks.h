@@ -39,3 +39,12 @@ bool SceneHooksRefreshTarget();
 
 // (mantida por compatibilidade; o teste de poses do passo 17 foi retirado)
 void SceneHooksStartPoseTest();
+
+// Quantos dos 99 ossos canonicos estao ligados ao esqueleto do jogador (para o menu).
+int SceneHooksBoundBones();
+
+// ---- seguidores: a pose do jogador aplicada ao esqueleto de outros atores (slots 0..2) ----
+bool SceneHooksBindFollower(int slot, void * actor);	// procura a tabela achatada do ator e liga os ossos
+void SceneHooksUnbindFollower(int slot);
+void SceneHooksFollowerPose(int slot, bool on);		// aplicar (ou nao) a pose do jogador a este seguidor
+bool SceneHooksFollowerBound(int slot);

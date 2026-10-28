@@ -338,3 +338,79 @@ bool FC_BuildPose(int motion, float phase, int direction, int style, float gap, 
 	}
 	catch(...) { return false; }
 }
+
+bool FC_Contacts(int motion, float phase, float * out4)
+{
+	try
+	{
+		if(!out4 || !FC_BoneCount() || !fc::isActiveMotion((fc::Motion)motion) || !(phase == phase)) return false;
+		const auto w = g_library->contactWeights((fc::Motion)motion, phase);
+		for(int i = 0; i < 4; ++i) out4[i] = w[i];
+		return true;
+	}
+	catch(...) { return false; }
+}
+
+namespace
+{
+	float Smooth01(float x) { x = x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x); return x * x * (3.0f - 2.0f * x); }
+}
+
+bool FC_LimbPositions(const float * pose990, float * out12)
+{
+	try
+	{
+		fc::Pose pose;
+		if(!pose990 || !out12 || !FC_BoneCount() || !ToPose(pose990, &pose)) return false;
+		const fc::Library & lib = *g_library;
+		const auto body = lib.world(pose);
+		const fc::Vec p[4] = { lib.palm(body, 0), lib.palm(body, 1), body[50].t, body[51].t };
+		for(int i = 0; i < 4; ++i) { out12[i * 3] = p[i].x; out12[i * 3 + 1] = p[i].y; out12[i * 3 + 2] = p[i].z; }
+		return true;
+	}
+	catch(...) { return false; }
+}
+
+bool FC_FitLimbs(float * pose990, const float * delta4, const float * weight4)
+{
+	try
+	{
+		fc::Pose p;
+		if(!pose990 || !delta4 || !weight4 || !FC_BoneCount() || !ToPose(pose990, &p)) return false;
+		const fc::Library & lib = *g_library;
+
+		for(int limb = 0; limb < 4; ++limb)
+		{
+			const bool foot = limb >= 2;
+			const int side = limb & 1;
+			const float weight = Smooth01((weight4[limb] - 0.15f) / 0.70f);
+			float error = delta4[limb];
+			if(weight <= 0.01f || !std::isfinite(error)) continue;
+			error = std::clamp(error, -10.0f, 10.0f) * weight;
+			if(std::fabs(error) < 0.05f) continue;
+
+			const int upper = foot ? (side ? 9 : 6) : (side ? 31 : 28);
+			const int mid	= foot ? (side ? 10 : 7) : (side ? 32 : 29);
+			const int end	= foot ? (side ? 11 : 8) : (side ? 39 : 38);
+
+			const auto body = lib.world(p);
+			fc::Pose candidate = p;
+			const fc::Quat localEnd = p[end].q, worldEnd = body[end].q;
+			lib.ik(candidate, upper, mid, end, body[end].t + fc::Vec{ 0, error, 0 }, body[mid].t);
+			lib.contactOrientation(candidate, end, localEnd, worldEnd);
+
+			// aceitacao continua (sem saltos): so com a articulacao dobrada o suficiente
+			const auto checked = lib.world(candidate);
+			const float bend = std::acos(std::clamp((checked[mid].t - checked[upper].t).unit().dot((checked[end].t - checked[mid].t).unit()), -1.0f, 1.0f));
+			if(!std::isfinite(bend)) continue;
+			const float accept = Smooth01((bend - 0.30f) / 0.31f);
+			if(accept <= 0.0f) continue;
+			for(std::size_t i = 0; i < p.size(); ++i) p[i] = fc::blend(p[i], candidate[i], accept);
+		}
+
+		g_library->guardArmBends(p);
+		FromPose(p, pose990);
+		return true;
+	}
+	catch(...) { return false; }
+}

@@ -53,3 +53,13 @@ bool		FC_PlaceRun(float * pose990, float gait, float dirX, float dirY, float sur
 // 'dirX/dirY' e 'dt' so contam na corrida; 'resetRun' = primeiro quadro de uma corrida.
 enum { FC_STYLE_WALL = 0, FC_STYLE_WALLFEET = 1, FC_STYLE_RUN = 2, FC_STYLE_BODY = 3, FC_STYLE_BACKFLIP = 4 };
 bool		FC_BuildPose(int motion, float phase, int direction, int style, float gap, float dirX, float dirY, float dt, bool resetRun, float * out990);
+
+// Pesos de contacto (0..1) do movimento nesta fase: [mao esq, mao dir, pe esq, pe dir]. Falso se desconhecido.
+bool		FC_Contacts(int motion, float phase, float * out4);
+
+// Posicoes (referencial do corpo: x direita, y frente, z cima, a partir dos pes) de [palma esq, palma dir, ponta do pe esq, ponta do pe dir].
+bool		FC_LimbPositions(const float * pose990, float * out12);
+
+// Ajusta a pose para os membros chegarem a superficie medida: delta4 = quanto cada membro deve avancar em y (+ para a parede),
+// weight4 = pesos de contacto (0..1). Maos e pes, com IK, de forma continua (sem saltos).
+bool		FC_FitLimbs(float * pose990, const float * delta4, const float * weight4);

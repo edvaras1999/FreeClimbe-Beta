@@ -16,6 +16,7 @@
 #include "PackLoader.h"
 #include "RttiReport.h"
 #include "SceneHooks.h"
+#include "Options.h"
 #include "Gameplay.h"
 
 #include <shlobj.h>
@@ -210,6 +211,14 @@ bool SKSEPlugin_Load(const SKSEInterface * skse)
 		_MESSAGE("ABORTING: the messaging interface is not available");
 		return false;
 	}
+
+	Options::SetMessaging(g_messaging);
+	Options::Init();
+
+	// o menu (MCM) fala com a DLL por funcoes nativas do Papyrus
+	SKSEPapyrusInterface * papyrus = (SKSEPapyrusInterface *)skse->QueryInterface(kInterface_Papyrus);
+	if(papyrus && papyrus->Register(Options::RegisterPapyrus)) _MESSAGE("papyrus interface: registered");
+	else _MESSAGE("WARNING: could not register the papyrus functions - the in-game menu will not work");
 
 	_MESSAGE("running");
 	return true;

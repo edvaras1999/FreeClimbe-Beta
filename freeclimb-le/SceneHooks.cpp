@@ -83,6 +83,9 @@ namespace
 	float				g_xfT = 1.0f, g_xfDur = 0.15f, g_weightRaw = 0.0f;
 	volatile LONG		g_frameActive = 0;
 	float				g_frameWeight = 0.0f;
+	float			g_folOut[99 * 10];
+	float			g_folWeight = 0.0f;
+	volatile LONG	g_folFrame = 0;
 	LARGE_INTEGER		g_qpcFreq, g_qpcLast;
 	bool				g_qpcReady = false;
 	volatile LONG		g_fault = 0;
@@ -240,10 +243,9 @@ namespace
 	//  - todos os ossos: rotacao = mistura(nativo, pose) com o peso do quadro;
 	//  - o centro do corpo (4): tambem recebe o deslocamento da pose e o ENQUADRAMENTO da raiz autoral (osso 0:
 	//    e ai que o original poe a distancia a parede e a rotacao do corpo para a parede/corrida).
-	void ComposeBone(int bone, Tr * local)
+	void ComposeBoneP(int bone, Tr * local, const float * out, float w)
 	{
-		const float w = g_frameWeight;
-		const float * p = g_out + bone * 10;
+		const float * p = out + bone * 10;
 		float qn[4];
 		ToQuat(local->r, qn);
 
@@ -259,7 +261,7 @@ namespace
 		float t[3];
 		for(int k = 0; k < 3; ++k) t[k] = local->t[k] + (p[k] - g_rest[4 * 10 + k]) * w;
 
-		const float * root = g_out;						// osso 0 = enquadramento do corpo
+		const float * root = out;						// osso 0 = enquadramento do corpo
 		const float identity[4] = { 0, 0, 0, 1 };
 		float fq[4];
 		QSlerp(identity, root + 3, w, fq);
@@ -272,6 +274,8 @@ namespace
 		QMul(fq, q, qq);
 		FromQuat(qq, local->r);
 	}
+
+	void ComposeBone(int bone, Tr * local) { ComposeBoneP(bone, local, g_out, g_frameWeight); }
 
 	// Uma vez por quadro (na passagem "para baixo"): decide a pose final, com fusao de entrada, de saida e entre movimentos.
 	void BeginFrame()
@@ -322,6 +326,10 @@ namespace
 
 		g_frameWeight = Ease(g_weightRaw);
 		InterlockedExchange(&g_frameActive, (g_haveOut && g_frameWeight > 0.0f) ? 1 : 0);
+
+		// os seguidores recebem uma copia da pose deste quadro (a pose e a do jogador)
+		if(g_frameActive) { memcpy(g_folOut, g_out, sizeof(g_out)); g_folWeight = g_frameWeight; InterlockedExchange(&g_folFrame, 1); }
+		else InterlockedExchange(&g_folFrame, 0);
 	}
 
 	// ---- modo novo: escrever os locais antes da passagem ----
@@ -384,6 +392,73 @@ namespace
 			if(memcmp(rot, g_written[b].r, 36) != 0) ++bad;
 		}
 		return bad;
+	}
+
+	// ---- seguidores: a pose do jogador aplicada ao esqueleto de outros atores (ate 3) ----
+	struct FolTarget
+	{
+		unsigned		actor, root, flat;
+		int				boneEntry[99];
+		unsigned		boneNode[99];
+		Tr				written[99], native[99];
+		bool			writtenValid[99];
+		volatile LONG	on, busy;
+		bool			bound;
+	};
+	FolTarget		g_fol[3];
+
+	int FollowerIndex(unsigned self)
+	{
+		for(int i = 0; i < 3; ++i) if(g_fol[i].bound && g_fol[i].flat == self) return i;
+		return -1;
+	}
+
+	// Antes de uma passagem da tabela achatada de um seguidor: escreve-lhe os locais, como ao jogador.
+	bool FollowerPrePass(int i, unsigned flat, unsigned * entriesOut)
+	{
+		FolTarget & f = g_fol[i];
+		if(!f.on || !g_folFrame || g_folWeight <= 0.0f) return false;
+
+		unsigned entries, count;
+		if(!FlatArray(flat, &entries, &count) || !ReadableMem(entries, count * 0x78)) return false;
+		for(int b = 0; b < 99; ++b)
+		{
+			const int idx = f.boneEntry[b];
+			if(idx < 0) continue;
+			if((unsigned)idx >= count || *(const unsigned *)(entries + (unsigned)idx * 0x78 + 0x70) != f.boneNode[b]) { f.bound = false; return false; }
+		}
+		if(InterlockedCompareExchange(&f.busy, 1, 0) != 0) return false;
+
+		float out[99 * 10];
+		memcpy(out, g_folOut, sizeof(out));
+		const float w = g_folWeight;
+		for(int b = 0; b < 99; ++b)
+		{
+			const int idx = f.boneEntry[b];
+			if(idx < 0) continue;
+
+			const unsigned e = entries + (unsigned)idx * 0x78;
+			const unsigned node = f.boneNode[b];
+			float * rot = node ? (float *)(node + 0x20) : (float *)(e + 0x00);
+			float * tr  = node ? (float *)(node + 0x44) : (float *)(e + 0x24);
+
+			Tr cur;
+			memcpy(cur.r, rot, 36); memcpy(cur.t, tr, 12); cur.s = 1.0f;
+			const bool ours = f.writtenValid[b] && memcmp(cur.r, f.written[b].r, 36) == 0 && (b != 4 || memcmp(cur.t, f.written[b].t, 12) == 0);
+			if(!ours) f.native[b] = cur;
+
+			Tr local = f.native[b];
+			ComposeBoneP(b, &local, out, w);
+
+			memcpy(rot, local.r, 36);
+			if(b == 4) memcpy(tr, local.t, 12);
+			f.written[b] = local;
+			if(b != 4) memcpy(f.written[b].t, cur.t, 12);
+			f.writtenValid[b] = true;
+		}
+		InterlockedExchange(&f.busy, 0);
+		*entriesOut = entries;
+		return true;
 	}
 
 	void LogStats(unsigned flat)
@@ -510,6 +585,17 @@ namespace
 		static void __fastcall call(void * self, void *, void * data, unsigned flags)
 		{
 			Count(K, self);
+			if(T == kFlatTree && g_poseMode == 1)
+			{
+				const int fi = FollowerIndex((unsigned)self);
+				if(fi >= 0)
+				{
+					unsigned entries = 0;
+					FollowerPrePass(fi, (unsigned)self, &entries);
+					original(self, data, flags);
+					return;
+				}
+			}
 			const bool player = (T == kFlatTree) && ((unsigned)self == g_playerFlat) && g_playerFlat;
 			if(player && g_poseMode == 1)
 			{
@@ -537,6 +623,17 @@ namespace
 		static void __fastcall call(void * self, void *, void * data)
 		{
 			Count(K, self);
+			if(T == kFlatTree && K == kTransform && g_poseMode == 1)
+			{
+				const int fi = FollowerIndex((unsigned)self);
+				if(fi >= 0)
+				{
+					unsigned entries = 0;
+					FollowerPrePass(fi, (unsigned)self, &entries);
+					original(self, data);
+					return;
+				}
+			}
 			const bool player = (T == kFlatTree) && (K == kTransform) && ((unsigned)self == g_playerFlat) && g_playerFlat;
 			if(player && g_poseMode == 1)
 			{
@@ -703,6 +800,13 @@ void SceneHooksSetPose(bool active, const float * pose990, int key, float blendS
 	InterlockedExchange(&g_reqActive, (active && pose990) ? 1 : 0);
 }
 
+int SceneHooksBoundBones()
+{
+	int n = 0;
+	for(int b = 0; b < 99; ++b) if(g_boneEntry[b] >= 0) ++n;
+	return n;
+}
+
 bool SceneHooksIsPlaying()
 {
 	return g_frameActive != 0;
@@ -818,4 +922,110 @@ bool SceneHooksRefreshTarget()
 
 	_MESSAGE("pose engine: skeleton target refreshed - root %08X, flat table %08X (%u entries), %u of 99 bones bound", root, flat, n, bound);
 	return bound > 0;
+}
+
+// ----------------------------------------------------------------------------------------------
+// Seguidores: a mesma pose do jogador aplicada ao esqueleto de outros atores (ate 3).
+bool SceneHooksBindFollower(int slot, void * actorPtr)
+{
+	if(slot < 0 || slot > 2 || !actorPtr) return false;
+	const unsigned kFlatVtable = 0x011186A4;
+	const unsigned actor = (unsigned)actorPtr;
+	if(!ReadableMem(actor, 4)) return false;
+	const unsigned vtable = *(const unsigned *)actor;
+	if(!ReadableMem(vtable + 0x6F * 4, 4)) return false;
+
+	typedef unsigned (__thiscall * GetRoot_t)(void *, unsigned);
+	const GetRoot_t getRoot = (GetRoot_t)*(const unsigned *)(vtable + 0x6F * 4);
+	const unsigned root = getRoot((void *)actor, 0);
+	if(!root || !ReadableMem(root, 0xC0)) return false;
+
+	unsigned flat = 0;
+	unsigned level[3][64]; unsigned count[3] = { 1, 0, 0 };
+	level[0][0] = root;
+	for(int depth = 0; depth < 3 && !flat; ++depth)
+	{
+		for(unsigned i = 0; i < count[depth] && !flat; ++i)
+		{
+			const unsigned node = level[depth][i];
+			if(!ReadableMem(node, 0xC0)) continue;
+			if(*(const unsigned *)node == kFlatVtable) { flat = node; break; }
+			if(depth == 2) continue;
+
+			const unsigned data = *(const unsigned *)(node + 0xAC);
+			const unsigned bound = *(const unsigned short *)(node + 0xB2);
+			if(!data || bound == 0 || bound > 64 || !ReadableMem(data, bound * 4)) continue;
+			for(unsigned c = 0; c < bound && count[depth + 1] < 64; ++c)
+			{
+				const unsigned child = *(const unsigned *)(data + 4 * c);
+				if(child) level[depth + 1][count[depth + 1]++] = child;
+			}
+		}
+	}
+	if(!flat || flat == g_playerFlat) return false;
+
+	unsigned entries, n;
+	if(!FlatArray(flat, &entries, &n) || !ReadableMem(entries, n * 0x78)) return false;
+
+	int map[99];
+	const int engineOwned[] = { 0, 1, 2, 3, 33, 34, 42, 43, 60, 61, 62, 63, 64, 65, 66, 97, 98 };
+	unsigned bound = 0;
+	for(int bone = 0; bone < 99; ++bone)
+	{
+		map[bone] = -1;
+		bool skip = false;
+		for(size_t k = 0; k < sizeof(engineOwned) / sizeof(engineOwned[0]); ++k) if(engineOwned[k] == bone) skip = true;
+		if(skip) continue;
+
+		const char * name = FC_BoneName(bone);
+		for(unsigned i = 0; i < n; ++i)
+		{
+			const unsigned e = entries + i * 0x78;
+			if(!ReadableMem(e + 0x74, 4)) continue;
+			const unsigned chars = *(const unsigned *)(e + 0x74);
+			if(!chars || !ReadableMem(chars, 48)) continue;
+			if(_strnicmp((const char *)chars, name, 47) == 0 && ((const char *)chars)[strlen(name)] == 0) { map[bone] = (int)i; ++bound; break; }
+		}
+	}
+	if(bound < 40) { _MESSAGE("follower %d: only %u bones matched - not binding", slot, bound); return false; }
+
+	FolTarget & f = g_fol[slot];
+	for(int spin = 0; spin < 200 && InterlockedCompareExchange(&f.busy, 1, 0) != 0; ++spin) Sleep(1);
+	f.on = 0;
+	f.bound = false;
+	for(int b = 0; b < 99; ++b)
+	{
+		f.boneEntry[b] = map[b]; f.boneNode[b] = 0; f.writtenValid[b] = false;
+		if(map[b] < 0) continue;
+		const unsigned node = *(const unsigned *)(entries + (unsigned)map[b] * 0x78 + 0x70);
+		if(node && !ReadableMem(node, 0x58)) { f.boneEntry[b] = -1; continue; }
+		f.boneNode[b] = node;
+	}
+	f.actor = actor; f.root = root; f.flat = flat;
+	f.bound = true;
+	InterlockedExchange(&f.busy, 0);
+
+	_MESSAGE("follower %d: skeleton bound - root %08X, flat table %08X, %u of 99 bones", slot, root, flat, bound);
+	return true;
+}
+
+void SceneHooksUnbindFollower(int slot)
+{
+	if(slot < 0 || slot > 2) return;
+	FolTarget & f = g_fol[slot];
+	for(int spin = 0; spin < 200 && InterlockedCompareExchange(&f.busy, 1, 0) != 0; ++spin) Sleep(1);
+	f.on = 0; f.bound = false; f.flat = 0; f.actor = 0;
+	InterlockedExchange(&f.busy, 0);
+}
+
+void SceneHooksFollowerPose(int slot, bool on)
+{
+	if(slot < 0 || slot > 2) return;
+	if(!on) for(int b = 0; b < 99; ++b) g_fol[slot].writtenValid[b] = false;
+	g_fol[slot].on = on ? 1 : 0;
+}
+
+bool SceneHooksFollowerBound(int slot)
+{
+	return slot >= 0 && slot <= 2 && g_fol[slot].bound;
 }

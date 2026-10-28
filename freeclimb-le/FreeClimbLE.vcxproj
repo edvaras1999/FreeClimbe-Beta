@@ -131,6 +131,7 @@
     <ClCompile Include="Engine.cpp" />
     <ClCompile Include="Havok.cpp" />
     <ClCompile Include="Gameplay.cpp" />
+    <ClCompile Include="Options.cpp" />
     <ClCompile Include="VtableScan.cpp" />
     <ClCompile Include="RttiReport.cpp" />
     <ClCompile Include="SceneHooks.cpp" />
@@ -182,6 +183,7 @@
     <ClInclude Include="Engine.h" />
     <ClInclude Include="Havok.h" />
     <ClInclude Include="Gameplay.h" />
+    <ClInclude Include="Options.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="FreeClimbLE.rc" />

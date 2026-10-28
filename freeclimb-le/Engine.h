@@ -147,6 +147,18 @@ namespace Engine
 		return fn(owner, av);
 	}
 
+	// ActorValueOwner slot 2: the maximum of a value (stamina cap, for percentages).
+	inline float GetMaxActorValue(Actor * actor, UInt32 av)
+	{
+		if(!Readable(actor, 0x64)) return 0.0f;
+		void * owner = (UInt8 *)actor + 0x60;
+		void ** vtable = *(void ***)owner;
+		if(!Readable(vtable, 3 * sizeof(void *))) return 0.0f;
+
+		float (__thiscall * fn)(void *, UInt32) = (float (__thiscall *)(void *, UInt32))vtable[2];
+		return fn(owner, av);
+	}
+
 	inline void DamageActorValue(Actor * actor, UInt32 av, float amount)
 	{
 		if(!Readable(actor, 0x64)) return;
