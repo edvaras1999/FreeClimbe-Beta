@@ -57,6 +57,8 @@ namespace
 	float			g_yawOff = 0.0f, g_yawOffVel = 0.0f, g_prevGoalYaw = 0.0f;
 	bool			g_yawInit = false, g_prevGoalValid = false;
 	float			g_moveT = 0.0f;
+	float			g_slideV = 0.0f;				// velocidade atual do escorregar (Shift + S), unidades/s
+	DWORD			g_slideSoundTick = 0;
 	float			g_fitDelta[4] = { 0, 0, 0, 0 };		// quanto cada membro deve avancar para tocar na superficie medida
 	int				g_fitRR = 0;
 	float			g_fpsAvg = 60.0f;
@@ -485,6 +487,7 @@ namespace
 		g_curStyle = FC_STYLE_WALL; g_curDir = 0;
 		g_prevContactMotion = 0;
 		for(int k = 0; k < 4; ++k) g_fitDelta[k] = 0.0f;
+		g_slideV = 0.0f;
 		Show(kHang, 0.0f, 0, FC_STYLE_WALL);
 		Options::PlaySoundFx(Options::kSndGrip);
 		InterlockedExchange(&g_state, kCling);
@@ -1000,11 +1003,29 @@ namespace
 		const bool preRun = g_in.sprint && iy >= 0.0f && preMoving;
 
 		// estamina: custo por segundo conforme o que esta a fazer; sem estamina nao se sobe, escorrega-se
+		const bool slideWant = g_cfg.slideOn && g_in.sprint && iy < -0.5f;		// Shift + S: escorregar
 		float stRate = g_cfg.stHang;
-		if(preRun) stRate = g_cfg.stRun;
+		if(slideWant) stRate = g_cfg.slideStamina;
+		else if(preRun) stRate = g_cfg.stRun;
 		else if(preMoving) stRate = fabsf(iy) * (iy > 0.0f ? g_cfg.stClimb : g_cfg.stDown) + fabsf(ix) * g_cfg.stSide;
 		const bool sliding = StaminaTick(player, frameDt, stRate);
 		if(sliding) { ix = 0.0f; iy = 0.0f; }
+
+		// ---- escorregar (Shift + S): acelera ate SlideMaxSpeed, trava ao largar; sem estamina passa ao escorregar lento
+		const bool slideKey = slideWant && !sliding;
+		if(slideKey)
+		{
+			if(g_slideV < 1.0f) { g_slideV = 60.0f; Options::PlaySoundFx(Options::kSndGrip); g_slideSoundTick = now; }
+			g_slideV += g_cfg.slideAccel * dt;
+			if(g_slideV > g_cfg.slideMax) g_slideV = g_cfg.slideMax;
+		}
+		else if(g_slideV > 0.0f)
+		{
+			g_slideV -= 1100.0f * dt;								// trava em ~0,25 s
+			if(g_slideV < 0.0f || sliding) g_slideV = 0.0f;
+		}
+		const bool slideActive = g_slideV > 0.5f;
+		if(slideKey && (DWORD)(now - g_slideSoundTick) > 300) { g_slideSoundTick = now; Options::PlaySoundFx(Options::kSndStep); }		// raspagem
 
 		g_inX = ix; g_inY = iy;
 		const bool moving = fabsf(ix) + fabsf(iy) > 0.1f;
@@ -1043,6 +1064,7 @@ namespace
 		float vt = ix * (sideV + (runSp - sideV) * mode) * ramp;
 		float vz = iy * (vertical + (runSp - vertical) * mode) * ramp;
 		if(sliding) { vt = 0.0f; vz = -g_cfg.stSlideSpeed; }
+		else if(slideActive) { vt = slideKey ? ix * sideV * 0.4f : 0.0f; vz = -g_slideV; }		// A/D corrige a trajetoria a 40%
 
 		// que movimento do pacote mostrar (como o original: o eixo dominante escolhe o ciclo)
 		int motion = kHang, runDir = 0, style = FC_STYLE_WALL;
@@ -1059,6 +1081,8 @@ namespace
 			if(fabsf(iy) > fabsf(ix))	motion = iy < 0.0f ? kDown : kUp;
 			else						motion = ix < 0.0f ? kLeft : kRight;
 		}
+
+		if(slideActive) { motion = kHang; style = FC_STYLE_WALL; runDir = 0; }		// escorregar: pose de agarrado, maos na parede
 
 		// ao comecar ou acabar de correr (ou ao mudar de lado), toca-se a sequencia de ponte do pacote
 		const bool lastLeft = g_lastRunMotion == kRunLeft || g_lastRunMotion == kRunDiagLeft, lastRight = g_lastRunMotion == kRunRight || g_lastRunMotion == kRunDiagRight;
@@ -1220,9 +1244,10 @@ namespace
 		}
 
 		// chegou ao chao a descer (ou a escorregar sem estamina)?
-		if(down || sliding)
+		if(down || sliding || slideActive)
 		{
-			const Havok::Result ground = Havok::RayCast(NiPoint3(g_pos[0], g_pos[1], g_pos[2] + 20.0f), NiPoint3(0, 0, -1), 40.0f, Havok::kLayer_Transparent, player);
+			const float lookahead = slideActive ? g_slideV * dt : 0.0f;		// a descer depressa, o chao e procurado mais abaixo (fps baixos = passos grandes)
+			const Havok::Result ground = Havok::RayCast(NiPoint3(g_pos[0], g_pos[1], g_pos[2] + 20.0f), NiPoint3(0, 0, -1), 40.0f + lookahead, Havok::kLayer_Transparent, player);
 			if(ground.didHit && ground.normal.z > 0.6f) { Release("reached the ground"); return; }
 		}
 

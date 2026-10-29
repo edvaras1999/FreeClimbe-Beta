@@ -3,6 +3,8 @@
 #include "skse/PapyrusNativeFunctions.h"
 #include "skse/PapyrusEvents.h"
 #include "skse/PluginAPI.h"
+#include "skse/GameData.h"
+#include "skse/GameForms.h"
 #include "Log.h"
 #include "Options.h"
 #include "SceneHooks.h"
@@ -56,6 +58,12 @@ namespace
 		{ "ContextHops",	'i', &g_cfg.contextHops,	1.0f,	0.0f,	1.0f,	"1 = salta sozinho para a parede seguinte quando a atual acaba." },
 		{ "CatchSpeed",		'f', &g_cfg.catchSpeed,		1.5f,	0.5f,	3.0f,	"Velocidade da animacao de apanhar a parede." },
 
+		{ NULL, 0, NULL, 0, 0, 0, "ESCORREGAR (Shift + S)" },
+		{ "SlideEnabled",	'i', &g_cfg.slideOn,			1.0f,	0.0f,	1.0f,	"Shift + S na parede: escorrega para baixo, acelerando; ao largar trava e fica agarrado." },
+		{ "SlideMaxSpeed",	'f', &g_cfg.slideMax,		280.0f,	50.0f,	600.0f,	"Velocidade maxima do escorregar (unidades por segundo)." },
+		{ "SlideAccel",		'f', &g_cfg.slideAccel,		220.0f,	50.0f,	1200.0f,	"Aceleracao do escorregar (unidades por segundo ao quadrado)." },
+		{ "SlideStamina",	'f', &g_cfg.slideStamina,	1.0f,	0.0f,	30.0f,	"Custo de estamina por segundo a escorregar (% do maximo)." },
+
 		{ NULL, 0, NULL, 0, 0, 0, "SUAVIDADE E MOTOR DE POSE" },
 		{ "TurnSmooth",		'f', &g_cfg.turnSmooth,		0.15f,	0.0f,	0.6f,	"Suavidade da rotacao do corpo para a parede, em segundos (0 = instantaneo)." },
 		{ "TurnSpeed",		'f', &g_cfg.turnSpeed,		540.0f,	60.0f,	1440.0f,	"Velocidade maxima de rotacao (graus por segundo)." },
@@ -93,10 +101,6 @@ namespace
 		{ "SurfaceFit",		'i', &g_cfg.fitOn,			1.0f,	0.0f,	1.0f,	"Ajusta maos e pes a superficie real (arvores, rochas, paredes irregulares)." },
 		{ "FitRays",		'i', &g_cfg.fitRays,		4.0f,	1.0f,	12.0f,	"Orcamento de raios por atualizacao (mais = mais preciso, mais pesado)." },
 		{ "FitMinFps",		'f', &g_cfg.fitMinFps,		35.0f,	10.0f,	120.0f,	"Abaixo destes fps o ajuste usa menos raios sozinho." },
-
-		{ NULL, 0, NULL, 0, 0, 0, "SEGUIDOR (experimental)" },
-		{ "FollowerEnabled",'i', &g_cfg.followerOn,		0.0f,	0.0f,	1.0f,	"O seguidor escolhido no FreeRun (F11) escala ao seu lado." },
-		{ "FollowerOffset",	'f', &g_cfg.followerOffset,	90.0f,	40.0f,	250.0f,	"Distancia lateral do seguidor a si na parede (unidades)." },
 
 		{ NULL, 0, NULL, 0, 0, 0, "MENU E DIAGNOSTICO" },
 		{ "Language",		'i', &g_cfg.language,		0.0f,	0.0f,	1.0f,	"Idioma do menu: 0 = English, 1 = Portugues." },
@@ -324,9 +328,17 @@ namespace
 		WriteIni();
 	}
 
-	bool	N_GetBool(StaticFunctionTag *, BSFixedString key)				{ const Opt * o = Find(key.data); return o ? Value(o) != 0.0f : false; }
-	SInt32	N_GetInt(StaticFunctionTag *, BSFixedString key)				{ const Opt * o = Find(key.data); return o ? (SInt32)Value(o) : 0; }
-	float	N_GetFloat(StaticFunctionTag *, BSFixedString key)			{ const Opt * o = Find(key.data); return o ? Value(o) : 0.0f; }
+	void NoteMenuCall()
+	{
+		static bool noted = false;
+		if(noted) return;
+		noted = true;
+		_MESSAGE("menu: the menu script called the DLL for the first time - Papyrus is running it");
+	}
+
+	bool	N_GetBool(StaticFunctionTag *, BSFixedString key)				{ NoteMenuCall(); const Opt * o = Find(key.data); return o ? Value(o) != 0.0f : false; }
+	SInt32	N_GetInt(StaticFunctionTag *, BSFixedString key)				{ NoteMenuCall(); const Opt * o = Find(key.data); return o ? (SInt32)Value(o) : 0; }
+	float	N_GetFloat(StaticFunctionTag *, BSFixedString key)			{ NoteMenuCall(); const Opt * o = Find(key.data); return o ? Value(o) : 0.0f; }
 	void	N_SetBool(StaticFunctionTag *, BSFixedString key, bool value)	{ SetOpt(key.data, value ? 1.0f : 0.0f); }
 	void	N_SetInt(StaticFunctionTag *, BSFixedString key, SInt32 value)	{ SetOpt(key.data, (float)value); }
 	void	N_SetFloat(StaticFunctionTag *, BSFixedString key, float value)	{ SetOpt(key.data, value); }
@@ -374,6 +386,7 @@ namespace
 	// 0 = pacote de animacoes ok, 1 = ossos ligados, 2 = a escalar, 3 = estamina em %
 	SInt32 N_Status(StaticFunctionTag *, SInt32 what)
 	{
+		NoteMenuCall();
 		return GameplayStatus(what);
 	}
 }
@@ -456,6 +469,45 @@ namespace Options
 		static const char * const names[4] = { "step", "grip", "push", "top" };
 		SKSEModCallbackEvent evn(BSFixedString("FreeClimb_Sound"), BSFixedString(names[sound]), g_cfg.soundVolume, sender);
 		g_modEvents->SendEvent(&evn);
+		static bool firstSound = true;
+		if(firstSound) { firstSound = false; _MESSAGE("sound: first event sent (%s). If you hear nothing, check the Papyrus log for 'FreeClimbMCM: sound event'", names[sound]); }
 		if(g_cfg.verbose) _MESSAGE("sound: %s", names[sound]);
+	}
+
+	void LogEnvironment()
+	{
+		DataHandler * data = DataHandler::GetSingleton();
+		if(!data) { _MESSAGE("environment: no data handler"); return; }
+
+		struct Probe { const char * what; UInt32 local; };
+		static const Probe probes[] =
+		{
+			{ "menu quest (FreeClimbMCMQuest)",	0x809 },
+			{ "sound marker FC_MenuStep",		0x801 },
+			{ "sound marker FC_MenuGrip",		0x802 },
+			{ "sound marker FC_MenuPush",		0x803 },
+			{ "sound marker FC_MenuTop",		0x804 },
+			{ "sound descriptor FC_Step",		0x805 },
+			{ "sound descriptor FC_Grip",		0x806 },
+			{ "sound descriptor FC_Push",		0x807 },
+			{ "sound descriptor FC_Top",			0x808 },
+		};
+
+		static const char * const plugins[] = { "SkyUI.esp", "FreeClimbMenu.esp" };
+		for(int i = 0; i < 2; ++i)
+		{
+			const ModInfo * mod = data->LookupModByName(plugins[i]);
+			if(mod) _MESSAGE("environment: %s is LOADED (index %02X)", plugins[i], (unsigned)mod->modIndex);
+			else	_MESSAGE("environment: %s is NOT loaded%s", plugins[i], i == 1 ? " - the menu and the sounds cannot work without it (check that the ESP is enabled)" : "");
+		}
+
+		const ModInfo * menu = data->LookupModByName("FreeClimbMenu.esp");
+		if(!menu) return;
+		for(size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); ++i)
+		{
+			TESForm * form = LookupFormByID(((UInt32)menu->modIndex << 24) | probes[i].local);
+			if(form) _MESSAGE("environment:   %s: found (form type %u)", probes[i].what, (unsigned)form->formType);
+			else	 _MESSAGE("environment:   %s: NOT FOUND", probes[i].what);
+		}
 	}
 }

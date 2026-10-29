@@ -22,7 +22,7 @@
 #include <shlobj.h>
 
 #define PLUGIN_NAME				"FreeClimbLE"
-#define PLUGIN_VERSION_STRING	"0.27.0 (passo A: camara/rotacao suaves, velocidade pelo clip, arranque lento)"
+#define PLUGIN_VERSION_STRING	"0.29.0 (versao final: escorregar com Shift+S; seguidor desativado)"
 #define PLUGIN_LOG_FILE			"\\My Games\\Skyrim\\SKSE\\FreeClimbLE.log"
 
 static PluginHandle				g_pluginHandle	= kPluginHandle_Invalid;
@@ -147,6 +147,7 @@ namespace
 				ReportRtti();
 				InstallSceneHooks();
 				InstallGameplay();
+				Options::LogEnvironment();
 				break;
 
 			case SKSEMessagingInterface::kMessage_InputLoaded:

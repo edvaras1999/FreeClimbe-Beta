@@ -63,9 +63,15 @@ struct FCConfig
 	int		fitRays;		// orcamento de raios por atualizacao
 	float	fitMinFps;		// abaixo destes fps o orcamento reduz-se sozinho
 
-	// ---- seguidor (experimental)
+	// ---- escorregar (Shift + S)
+	int		slideOn;
+	float	slideMax;		// velocidade maxima (unidades/s)
+	float	slideAccel;		// aceleracao (unidades/s2)
+	float	slideStamina;	// custo por segundo (% da estamina maxima)
+
+	// ---- seguidor: DESATIVADO (sem opcao no menu nem no .ini; o codigo fica adormecido, followerOn e sempre 0)
 	int		followerOn;
-	float	followerOffset;	// distancia lateral ao jogador (unidades)
+	float	followerOffset;
 
 	// ---- menu / diagnostico
 	int		language;		// 0 = English, 1 = Portugues
@@ -86,6 +92,9 @@ namespace Options
 	enum { kSndStep = 0, kSndGrip = 1, kSndPush = 2, kSndTop = 3 };
 	void			SetMessaging(SKSEMessagingInterface * messaging);
 	void			PlaySoundFx(int sound, TESForm * sender = 0);	// 'sender' = quem faz o som (0 = o jogador)
+
+	// Diagnostico: escreve no log que plugins e formularios do menu o jogo carregou (chamar depois de os dados carregarem).
+	void			LogEnvironment();
 }
 
 // Implementado em Gameplay.cpp: estado para o menu (0 = pacote de animacoes ok, 1 = ossos ligados, 2 = a escalar, 3 = estamina em %).

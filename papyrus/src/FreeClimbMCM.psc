@@ -18,6 +18,7 @@ string[] ofmt
 string[] oinfo
 int ocount
 int lang        ; 0 = English, 1 = Portugues
+int soundSeen   ; how many sound events were received (only the first few are logged)
 
 ; ---- climbing sounds (looked up once, on first use)
 Sound sndStep
@@ -46,10 +47,12 @@ Function InitTables()
 EndFunction
 
 Event OnConfigInit()
+    Debug.Trace("FreeClimbMCM: OnConfigInit - the menu script is running")
     ModName = "FreeClimb"
     InitTables()
     SetPageNames()
     RegisterSoundEvent()
+    Debug.Trace("FreeClimbMCM: menu registered as 'FreeClimb' with " + (Pages.Length as string) + " pages")
 EndEvent
 
 Event OnVersionUpdate(int a_version)
@@ -59,6 +62,7 @@ Event OnVersionUpdate(int a_version)
 EndEvent
 
 Event OnConfigOpen()
+    Debug.Trace("FreeClimbMCM: menu opened")
     InitTables()
     SetPageNames()
     RegisterSoundEvent()
@@ -70,6 +74,10 @@ EndFunction
 
 ; ---- sounds: the DLL sends the event; the SOUN records live in FreeClimbMenu.esp (they wrap the FC_* descriptors of FreeClimb.esp)
 Event OnFreeClimbSound(string a_eventName, string a_name, float a_volume, Form a_sender)
+    if soundSeen < 3
+        soundSeen += 1
+        Debug.Trace("FreeClimbMCM: sound event '" + a_name + "' received")
+    endIf
     Sound s = None
     if a_name == "step"
         if sndStep == None
@@ -93,6 +101,7 @@ Event OnFreeClimbSound(string a_eventName, string a_name, float a_volume, Form a
         s = sndTop
     endIf
     if s == None
+        Debug.Trace("FreeClimbMCM: sound marker for '" + a_name + "' was not found in FreeClimbMenu.esp")
         return
     endIf
     ObjectReference src = a_sender as ObjectReference
@@ -100,6 +109,9 @@ Event OnFreeClimbSound(string a_eventName, string a_name, float a_volume, Form a
         src = Game.GetPlayer()
     endIf
     int h = s.Play(src)
+    if h == 0 && soundSeen < 4
+        Debug.Trace("FreeClimbMCM: Sound.Play returned 0 for '" + a_name + "' (the sound descriptor may be missing or silent)")
+    endIf
     if h != 0 && a_volume < 0.99
         Sound.SetInstanceVolume(h, a_volume)
     endIf
@@ -116,7 +128,7 @@ EndFunction
 ; Page names follow the chosen language (they refresh the next time the menu is opened).
 Function SetPageNames()
     lang = FreeClimbNative.GetInt("Language")
-    Pages = new string[8]
+    Pages = new string[7]
     Pages[0] = T("General", "Geral")
     Pages[1] = T("Movement", "Movimento")
     Pages[2] = T("Wall & entry", "Parede e entrada")
@@ -124,7 +136,6 @@ Function SetPageNames()
     Pages[4] = T("Stamina", "Estamina")
     Pages[5] = T("Surface & FPS", "Superficie e FPS")
     Pages[6] = T("Sounds", "Sons")
-    Pages[7] = T("Follower", "Seguidor")
 EndFunction
 
 string Function ChoiceText(int menuId, int index)
@@ -282,10 +293,8 @@ Event OnPageReset(string a_page)
         PageStamina()
     elseIf p == 5
         PageSurface()
-    elseIf p == 6
-        PageSounds()
     else
-        PageFollower()
+        PageSounds()
     endIf
 EndEvent
 
@@ -336,6 +345,13 @@ Function PageMovement()
     AddToggleRow("HopProbe", T("Read the wall before hopping", "Ler a parede antes de saltar"), 1.0, T("Follows the wall (also around pillars and trees). With no wall ahead, the hop is a normal jump and you fall.", "Segue a parede (tambem em pilares e arvores). Sem parede a frente, o salto e normal e voce cai."))
     AddToggleRow("ContextHops", T("Hop to the next wall", "Saltar para a parede seguinte"), 1.0, T("Hops by itself to the next wall when this one ends.", "Salta sozinho para a parede seguinte quando esta acaba."))
     AddSliderRow("CatchSpeed", T("Grab animation speed", "Velocidade de agarrar"), 0.5, 3.0, 0.1, 1.5, 1.0, 0, "{1}x", "")
+    AddEmptyOption()
+    AddHeaderOption(T("Slide down (Shift + S)", "Escorregar (Shift + S)"))
+    AddEmptyOption()
+    AddToggleRow("SlideEnabled", T("Slide with Shift + S", "Escorregar com Shift + S"), 1.0, T("Hold Shift + S on the wall to slide down, speeding up. Let go to brake and keep hanging. At the ground you land standing.", "Segure Shift + S na parede para escorregar, acelerando. Largue para travar e ficar agarrado. No chao, aterra de pe."))
+    AddSliderRow("SlideMaxSpeed", T("Slide top speed", "Velocidade maxima"), 50.0, 600.0, 10.0, 280.0, 1.0, 0, "{0}", "")
+    AddSliderRow("SlideAccel", T("Slide acceleration", "Aceleracao"), 50.0, 1200.0, 10.0, 220.0, 1.0, 0, "{0}", T("How fast it speeds up. A/D steers at 40% speed while sliding.", "Quao depressa acelera. O A/D corrige a trajetoria a 40% da velocidade."))
+    AddSliderRow("SlideStamina", T("Stamina cost", "Custo de estamina"), 0.0, 30.0, 0.5, 1.0, 1.0, 0, "{1} %/s", "")
 EndFunction
 
 Function PageWall()
@@ -423,13 +439,6 @@ Function PageSounds()
     AddToggleRow("SoundEnabled", T("Play climbing sounds", "Tocar os sons da escalada"), 1.0, T("Grab, steps, push-off and pulling over a ledge.", "Agarrar, passos, impulso e passar a borda."))
     AddSliderRow("SoundVolume", T("Volume", "Volume"), 0.0, 1.0, 0.05, 1.0, 100.0, 0, "{0}%", "")
     AddSliderRow("SoundGapMs", T("Minimum gap between repeats", "Intervalo minimo entre repeticoes"), 0.0, 1000.0, 10.0, 140.0, 1.0, 0, "{0} ms", "")
-EndFunction
-
-Function PageFollower()
-    AddHeaderOption(T("Follower (experimental)", "Seguidor (experimental)"))
-    AddEmptyOption()
-    AddToggleRow("FollowerEnabled", T("Follower climbs with me", "O seguidor escala comigo"), 0.0, T("The follower picked with F11 in FreeRun climbs beside you, repeating your moves.", "O seguidor escolhido com F11 no FreeRun escala ao seu lado, repetindo os seus movimentos."))
-    AddSliderRow("FollowerOffset", T("Distance to me", "Distancia a mim"), 40.0, 250.0, 5.0, 90.0, 1.0, 0, "{0}", T("Sideways distance on the wall.", "Distancia lateral na parede."))
 EndFunction
 
 ; ---- events
