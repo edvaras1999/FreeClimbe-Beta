@@ -1,11 +1,13 @@
-CORRECAO DO ERRO LNK2001 (GameData / GameForms)
+CORRECAO DO ERRO DE LINK LNK2001
 
-O erro acontece porque Options.cpp chama funcoes implementadas pelo SKSE em GameData.cpp e GameForms.cpp.
+O erro anterior dos metodos LookupModByName/GetSingleton e LookupFormByID foi resolvido, mas adicionar os ficheiros completos GameData.cpp e GameForms.cpp trouxe uma dependencia adicional: g_invalidRefHandle.
+
+Esta revisao remove a verificacao dinamica de plugins/forms do log (era apenas diagnostica) e remove esses dois ficheiros extras do projeto. O MCM, o registo Papyrus e as funcoes do mod continuam intactos. O log apenas lembra que SkyUI.esp e FreeClimbMenu.esp sao requisitos.
 
 Para aplicar no GitHub:
 1. Extraia este ZIP.
-2. Copie/substitua no repositorio as pastas .github e freeclimb-le, mantendo a estrutura.
-3. Faca commit/push das alteracoes.
-4. Execute novamente o workflow "Build FreeClimb LE" no commit novo.
+2. Substitua as pastas .github e freeclimb-le no repositorio, mantendo a estrutura.
+3. Faca commit e push.
+4. Execute novamente o workflow Build FreeClimb LE no novo commit.
 
-O workflow agora garante que GameData.cpp e GameForms.cpp sejam acrescentados ao projeto gerado, mesmo se o vcxproj estiver desatualizado. No log novo, procure "Adicionei ao projeto" ou "Ja consta no projeto" para ambos os ficheiros. O aviso GetVersionExA e apenas um aviso e nao causa este erro de link.
+A compilacao foi validada estruturalmente neste pacote, mas nao foi executada aqui porque o SDK do SKSE e o MSBuild do GitHub Actions nao estao presentes neste ambiente.

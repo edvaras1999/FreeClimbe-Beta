@@ -476,38 +476,8 @@ namespace Options
 
 	void LogEnvironment()
 	{
-		DataHandler * data = DataHandler::GetSingleton();
-		if(!data) { _MESSAGE("environment: no data handler"); return; }
-
-		struct Probe { const char * what; UInt32 local; };
-		static const Probe probes[] =
-		{
-			{ "menu quest (FreeClimbMCMQuest)",	0x809 },
-			{ "sound marker FC_MenuStep",		0x801 },
-			{ "sound marker FC_MenuGrip",		0x802 },
-			{ "sound marker FC_MenuPush",		0x803 },
-			{ "sound marker FC_MenuTop",		0x804 },
-			{ "sound descriptor FC_Step",		0x805 },
-			{ "sound descriptor FC_Grip",		0x806 },
-			{ "sound descriptor FC_Push",		0x807 },
-			{ "sound descriptor FC_Top",			0x808 },
-		};
-
-		static const char * const plugins[] = { "SkyUI.esp", "FreeClimbMenu.esp" };
-		for(int i = 0; i < 2; ++i)
-		{
-			const ModInfo * mod = data->LookupModByName(plugins[i]);
-			if(mod) _MESSAGE("environment: %s is LOADED (index %02X)", plugins[i], (unsigned)mod->modIndex);
-			else	_MESSAGE("environment: %s is NOT loaded%s", plugins[i], i == 1 ? " - the menu and the sounds cannot work without it (check that the ESP is enabled)" : "");
-		}
-
-		const ModInfo * menu = data->LookupModByName("FreeClimbMenu.esp");
-		if(!menu) return;
-		for(size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); ++i)
-		{
-			TESForm * form = LookupFormByID(((UInt32)menu->modIndex << 24) | probes[i].local);
-			if(form) _MESSAGE("environment:   %s: found (form type %u)", probes[i].what, (unsigned)form->formType);
-			else	 _MESSAGE("environment:   %s: NOT FOUND", probes[i].what);
-		}
+		_MESSAGE("environment: required plugins are SkyUI.esp and FreeClimbMenu.esp");
+		_MESSAGE("environment: plugin/form presence is not queried by this LE build");
 	}
 }
+
