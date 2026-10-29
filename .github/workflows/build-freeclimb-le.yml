@@ -102,29 +102,6 @@ jobs:
           $dest = "$root\skse\FreeClimbLE"
           New-Item -ItemType Directory -Force $dest | Out-Null
           Copy-Item "$ws\freeclimb-le\*" $dest -Recurse -Force
-
-          # Options.cpp consulta plugins e formas. Garanta que as implementacoes
-          # do SKSE fazem parte do projeto, mesmo se o vcxproj do repositorio
-          # ainda for uma revisao antiga.
-          $projectPath = Join-Path $dest 'FreeClimbLE.vcxproj'
-          [xml]$project = Get-Content -LiteralPath $projectPath
-          $nsUri = 'http://schemas.microsoft.com/developer/msbuild/2003'
-          $ns = New-Object System.Xml.XmlNamespaceManager($project.NameTable)
-          $ns.AddNamespace('m', $nsUri)
-          $compileGroup = $project.SelectSingleNode('/m:Project/m:ItemGroup[m:ClCompile]', $ns)
-          if (-not $compileGroup) { throw 'Nao encontrei o ItemGroup de fontes no FreeClimbLE.vcxproj.' }
-          foreach ($source in @('..\..\skse\skse\GameData.cpp', '..\..\skse\skse\GameForms.cpp')) {
-            $found = $project.SelectSingleNode("/m:Project/m:ItemGroup/m:ClCompile[@Include='$source']", $ns)
-            if (-not $found) {
-              $item = $project.CreateElement('ClCompile', $nsUri)
-              $item.SetAttribute('Include', $source)
-              [void]$compileGroup.AppendChild($item)
-              Write-Host "Adicionei ao projeto: $source"
-            } else {
-              Write-Host "Ja consta no projeto: $source"
-            }
-          }
-          $project.Save($projectPath)
           "SKSE_ROOT=$root" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
       - name: Compilar (Release, 32 bits)
@@ -279,3 +256,4 @@ jobs:
           name: resultado
           path: out
           if-no-files-found: warn
+
