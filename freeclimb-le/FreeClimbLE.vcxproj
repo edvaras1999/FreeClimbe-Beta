@@ -114,6 +114,8 @@
     <ClCompile Include="FreeClimbLE.cpp" />
     <ClCompile Include="..\..\skse\skse\SafeWrite.cpp" />
     <ClCompile Include="..\..\skse\skse\GameAPI.cpp" />
+    <ClCompile Include="..\..\skse\skse\GameData.cpp" />
+    <ClCompile Include="..\..\skse\skse\GameForms.cpp" />
     <ClCompile Include="..\..\skse\skse\GameMenus.cpp" />
     <ClCompile Include="..\..\skse\skse\GameTypes.cpp" />
     <ClCompile Include="..\..\skse\skse\NiTypes.cpp" />
